@@ -9,9 +9,9 @@ Public entry points:
     engine.insert("items", {"id": 1})
 """
 
-from .engine import ConflictError, ConstraintError, Engine, ReadOnlyView, Transaction
+from .engine import ConflictError, ConstraintError, Engine, ReadConflictError, ReadOnlyView, Transaction
 from .pager import PAGE_SIZE, Pager, StorageError
 
 __version__ = "0.1.0"
 
-__all__ = ["Engine", "Transaction", "StorageError"]
+__all__ = ["Engine", "Transaction", "StorageError", "ConflictError", "ReadConflictError"]

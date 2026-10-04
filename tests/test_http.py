@@ -185,6 +185,48 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(self.call("GET", "/v1/tables/users/rows/1")[1]["name"], "ann")
         self.assertTrue(self.call("GET", "/v1/verify")[1]["ok"])
 
+    def test_isolation_parameter(self):
+        self.create()
+        self.call("POST", "/v1/tables/users/rows", {"rows": [{"id": 1, "name": "ann", "age": 30}]})
+
+        # an explicit serializable transaction works
+        status, body = self.call("POST", "/v1/tx", {
+            "isolation": "serializable",
+            "ops": [{"op": "insert", "table": "users", "row": {"id": 2, "name": "bob", "age": 20}}],
+        })
+        self.assertEqual(status, 200)
+        self.assertTrue(body["committed"])
+
+        # invalid isolation values are 400 with the usual error object
+        for bad in ("read-committed", 123, ["serializable"], None):
+            status, body = self.call("POST", "/v1/tx", {
+                "isolation": bad,
+                "ops": [{"op": "insert", "table": "users", "row": {"id": 3, "name": "x", "age": 1}}],
+            })
+            self.assertEqual(status, 400)
+            self.assertIn("error", body)
+
+        # serializable together with a non-null snapshot is 400 and creates nothing
+        status, body = self.call("POST", "/v1/tx", {
+            "isolation": "serializable",
+            "snapshot_txid": 1,
+            "ops": [{"op": "insert", "table": "users", "row": {"id": 4, "name": "y", "age": 1}}],
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+        self.assertEqual(self.call("GET", "/v1/tables/users/rows/4")[0], 404)
+
+        # a serializable read-write conflict surfaces as the existing 409
+        reader = self.engine.begin(isolation="serializable")
+        reader.get("users", 1)
+        status, body = self.call("POST", "/v1/tx", {
+            "ops": [{"op": "update", "table": "users", "pk": 1, "patch": {"age": 31}}],
+        })
+        self.assertEqual(status, 200)
+        from kvse.engine import ReadConflictError
+        with self.assertRaises(ReadConflictError):
+            reader.commit()
+
 
 if __name__ == "__main__":
     unittest.main()
