@@ -709,7 +709,12 @@ class Engine:
                 raise
 
     def transaction(self, ops, snapshot=None, isolation=None):
-        """Apply a batch of operations in one transaction; roll back on error."""
+        """Apply a batch of operations in one transaction; roll back on error.
+
+        Besides ``insert``/``update``/``delete`` an op may be ``savepoint``,
+        ``rollback_to`` or ``release_savepoint`` with a ``name`` field; those
+        steer the transaction but are never written to the audit log.
+        """
         with self._lock:
             tx = self._begin(snapshot, isolation)
             try:
@@ -723,6 +728,12 @@ class Engine:
                         tx.update(op["table"], op.get("pk"), op.get("patch") or {})
                     elif kind == "delete":
                         tx.delete(op["table"], op.get("pk"))
+                    elif kind == "savepoint":
+                        tx.savepoint(op.get("name"))
+                    elif kind == "rollback_to":
+                        tx.rollback_to(op.get("name"))
+                    elif kind == "release_savepoint":
+                        tx.release_savepoint(op.get("name"))
                     else:
                         raise StorageError("unsupported op %r" % (kind,))
                 lsn = tx.commit()
@@ -883,6 +894,7 @@ class Transaction:
         self._undo = []
         self._reads = []
         self._suppress = 0
+        self._savepoints = []
         self._commit_horizon = engine._commit_counter
 
     def __enter__(self):
@@ -961,6 +973,61 @@ class Transaction:
             self._reads.append(("where", table, tuple(conds)))
             return result
 
+    # -------------------------------------------------------------- savepoints
+    @staticmethod
+    def _check_savepoint_name(name):
+        if not isinstance(name, str) or not name.strip():
+            raise StorageError("savepoint name must be a non-empty, non-blank string")
+
+    def _savepoint_index(self, name):
+        for index, (saved, _, _) in enumerate(self._savepoints):
+            if saved == name:
+                return index
+        raise StorageError("unknown savepoint %r in transaction %d" % (name, self.txid))
+
+    def savepoint(self, name):
+        """Mark the current position so later writes can be rolled back to it.
+
+        Names are case sensitive and only live inside this transaction; a
+        name that is still taken by an active savepoint cannot be reused.
+        """
+        self._check_active()
+        with self.engine._lock:
+            self._check_savepoint_name(name)
+            if any(saved == name for saved, _, _ in self._savepoints):
+                raise StorageError(
+                    "savepoint %r already exists in transaction %d" % (name, self.txid)
+                )
+            self._savepoints.append((name, len(self._undo), len(self.ops)))
+            return True
+
+    def rollback_to(self, name):
+        """Undo every write made after ``name`` was created; keep the target.
+
+        Savepoints created after the target stop existing and their names may
+        be reused; the target itself stays valid and can be rolled back to
+        again.  Recorded serializable read predicates are kept either way.
+        """
+        self._check_active()
+        with self.engine._lock:
+            self._check_savepoint_name(name)
+            index = self._savepoint_index(name)
+            _, undo_mark, ops_mark = self._savepoints[index]
+            while len(self._undo) > undo_mark:
+                self._undo.pop()()
+            del self.ops[ops_mark:]
+            del self._savepoints[index + 1:]
+            return True
+
+    def release_savepoint(self, name):
+        """Forget ``name`` and every savepoint created after it, keeping writes."""
+        self._check_active()
+        with self.engine._lock:
+            self._check_savepoint_name(name)
+            index = self._savepoint_index(name)
+            del self._savepoints[index:]
+            return True
+
     # -------------------------------------------------------------- lifecycle
     def commit(self):
         with self.engine._lock:
@@ -992,6 +1059,7 @@ class Transaction:
                 raise
             self.state = "committed"
             self._undo = []
+            self._savepoints = []
             engine._finish(self, True)
             return lsn
 
@@ -1009,6 +1077,7 @@ class Transaction:
         while self._undo:
             self._undo.pop()()
         self.ops = []
+        self._savepoints = []
 
 
 class ReadOnlyView:

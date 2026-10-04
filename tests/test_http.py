@@ -173,6 +173,38 @@ class HttpTests(unittest.TestCase):
         self.assertEqual(status, 200)  # a null snapshot_txid is no pinning
         self.assertEqual(self.call("GET", "/v1/tables/users/rows/1")[1]["age"], 31)
 
+    def test_tx_savepoint_ops(self):
+        self.create()
+        self.call("POST", "/v1/tables/users/rows", {"rows": [{"id": 1, "name": "ann", "age": 30}]})
+        status, body = self.call("POST", "/v1/tx", {"ops": [
+            {"op": "savepoint", "name": "sp"},
+            {"op": "insert", "table": "users", "row": {"id": 2, "name": "bob", "age": 20}},
+            {"op": "rollback_to", "name": "sp"},
+            {"op": "update", "table": "users", "pk": 1, "patch": {"age": 31}},
+            {"op": "release_savepoint", "name": "sp"},
+        ]})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["committed"])
+        self.assertEqual(self.call("GET", "/v1/tables/users/rows/2")[0], 404)
+        self.assertEqual(self.call("GET", "/v1/tables/users/rows/1")[1]["age"], 31)
+        ops = self.call("GET", "/v1/audit?limit=1")[1]["entries"][0]["ops"]
+        self.assertEqual([op["op"] for op in ops], ["update"])  # savepoints leave no audit
+
+        for bad_ops in ([{"op": "savepoint", "name": "  "}], [{"op": "savepoint"}],
+                        [{"op": "rollback_to", "name": "nope"}],
+                        [{"op": "release_savepoint", "name": "nope"}]):
+            status, body = self.call("POST", "/v1/tx", {"ops": bad_ops})
+            self.assertEqual(status, 400)
+            self.assertIn("error", body)
+
+        status, body = self.call("POST", "/v1/tx", {"ops": [
+            {"op": "savepoint", "name": "sp"},
+            {"op": "insert", "table": "users", "row": {"id": 5, "name": "eve", "age": 50}},
+            {"op": "insert", "table": "users", "row": {"id": 1, "name": "dup", "age": 1}},
+        ]})
+        self.assertEqual(status, 409)  # constraint errors still roll the whole batch back
+        self.assertEqual(self.call("GET", "/v1/tables/users/rows/5")[0], 404)
+
     def test_verify_audit_and_error_shapes(self):
         self.create()
         self.call("POST", "/v1/tables/users/rows", {"rows": [{"id": 1, "name": "ann", "age": 30}]})

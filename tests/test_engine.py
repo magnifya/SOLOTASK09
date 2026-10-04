@@ -279,6 +279,131 @@ class EngineTests(unittest.TestCase):
         with self.assertRaises(StorageError):
             self.engine.restore(os.path.join(self.root, "missing"))
 
+    # ------------------------------------------------------------- savepoints
+    def test_savepoint_rolls_back_partial_writes(self):
+        self.add(1, "ann", 30)
+        tx = self.engine.begin()
+        tx.insert("users", {"id": 2, "name": "bob", "age": 20})
+        self.assertTrue(tx.savepoint("sp1"))
+        tx.update("users", 1, {"age": 31})
+        tx.update("users", 1, {"age": 32})
+        tx.insert("users", {"id": 3, "name": "cid", "age": 40})
+        tx.delete("users", 2)
+        self.assertTrue(tx.rollback_to("sp1"))
+        self.assertEqual(tx.get("users", 1)["age"], 30)
+        self.assertEqual(tx.get("users", 2)["name"], "bob")
+        self.assertIsNone(tx.get("users", 3))
+        self.assertEqual([r["id"] for r in tx.scan("users")], [1, 2])
+        self.assertEqual(tx.index_get("users", "name", "cid"), [])
+        self.assertEqual([r["id"] for r in tx.index_range("users", "age", 0, 99)], [2, 1])
+        # primary key and unique slots occupied after the savepoint are free again
+        tx.insert("users", {"id": 3, "name": "cid", "age": 41})
+        tx.commit()
+        self.assertEqual(self.engine.get("users", 1)["age"], 30)
+        self.assertEqual(self.engine.get("users", 3)["age"], 41)
+        self.assertTrue(self.engine.verify()["ok"])
+
+    def test_savepoint_name_validation_and_unknown_names(self):
+        tx = self.engine.begin()
+        for bad in (None, "", "   ", 5, b"x", ["a"]):
+            with self.assertRaises(StorageError):
+                tx.savepoint(bad)
+            with self.assertRaises(StorageError):
+                tx.rollback_to(bad)
+            with self.assertRaises(StorageError):
+                tx.release_savepoint(bad)
+        self.assertEqual(tx.state, "active")
+        self.assertTrue(tx.savepoint("a"))
+        with self.assertRaises(StorageError):
+            tx.savepoint("a")  # duplicate while still active
+        self.assertTrue(tx.savepoint("A"))  # names are case sensitive
+        with self.assertRaises(StorageError):
+            tx.rollback_to("nope")
+        with self.assertRaises(StorageError):
+            tx.release_savepoint("nope")
+        tx.rollback()
+
+    def test_nested_savepoints_invalidate_and_release(self):
+        self.add(1, "ann", 30)
+        tx = self.engine.begin()
+        tx.savepoint("s1")
+        tx.update("users", 1, {"age": 31})
+        tx.savepoint("s2")
+        tx.update("users", 1, {"age": 32})
+        tx.savepoint("s3")
+        tx.update("users", 1, {"age": 33})
+        self.assertTrue(tx.rollback_to("s2"))
+        self.assertEqual(tx.get("users", 1)["age"], 31)
+        with self.assertRaises(StorageError):
+            tx.rollback_to("s3")  # savepoints after the target are gone
+        self.assertTrue(tx.savepoint("s3"))  # an invalidated name can be reused
+        tx.update("users", 1, {"age": 34})
+        self.assertTrue(tx.rollback_to("s2"))  # the target itself stays valid
+        self.assertEqual(tx.get("users", 1)["age"], 31)
+        self.assertTrue(tx.release_savepoint("s1"))  # drops s1 and everything after
+        with self.assertRaises(StorageError):
+            tx.rollback_to("s2")
+        self.assertEqual(tx.get("users", 1)["age"], 31)  # release never undoes writes
+        tx.commit()
+        self.assertEqual(self.engine.get("users", 1)["age"], 31)
+
+    def test_savepoints_leave_lsn_audit_and_finished_state_untouched(self):
+        self.add(1, "ann", 30)
+        lsn = self.engine.lsn
+        audit_len = len(self.engine.audit())
+        tx = self.engine.begin()
+        tx.savepoint("s1")
+        tx.insert("users", {"id": 2, "name": "bob", "age": 20})
+        tx.savepoint("s2")
+        tx.delete("users", 2)
+        tx.rollback_to("s2")
+        tx.release_savepoint("s1")
+        self.assertEqual(self.engine.lsn, lsn)  # savepoints never advance the lsn
+        self.assertEqual(len(self.engine.audit()), audit_len)
+        tx.commit()
+        entries = self.engine.audit()
+        self.assertEqual(len(entries), audit_len + 1)
+        self.assertEqual([op["op"] for op in entries[-1]["ops"]], ["insert"])
+        for call in (lambda: tx.savepoint("x"), lambda: tx.rollback_to("x"),
+                     lambda: tx.release_savepoint("x")):
+            with self.assertRaises(StorageError):
+                call()  # the transaction is finished
+
+    def test_transaction_batch_accepts_savepoint_ops(self):
+        self.add(1, "ann", 30)
+        result = self.engine.transaction([
+            {"op": "savepoint", "name": "sp"},
+            {"op": "insert", "table": "users", "row": {"id": 2, "name": "bob", "age": 20}},
+            {"op": "rollback_to", "name": "sp"},
+            {"op": "insert", "table": "users", "row": {"id": 3, "name": "cid", "age": 40}},
+            {"op": "release_savepoint", "name": "sp"},
+        ])
+        self.assertTrue(result["committed"])
+        self.assertIsNone(self.engine.get("users", 2))
+        self.assertEqual(self.engine.get("users", 3)["name"], "cid")
+        self.assertEqual([op["op"] for op in self.engine.audit()[-1]["ops"]], ["insert"])
+
+        with self.assertRaises(StorageError):
+            self.engine.transaction([
+                {"op": "insert", "table": "users", "row": {"id": 9, "name": "zed", "age": 1}},
+                {"op": "rollback_to", "name": "missing"},
+            ])
+        self.assertIsNone(self.engine.get("users", 9))  # the whole batch rolled back
+
+    def test_serializable_reads_survive_a_savepoint_rollback(self):
+        self.add(1, "ann", 30)
+        tx = self.engine.begin(isolation="serializable")
+        self.assertEqual(tx.get("users", 1)["age"], 30)
+        tx.savepoint("sp")
+        tx.update("users", 1, {"age": 31})
+        tx.rollback_to("sp")
+        self.assertEqual(tx.get("users", 1)["age"], 30)
+        self.engine.update("users", 1, {"age": 99})  # commits after tx started
+        with self.assertRaises(ConflictError):
+            tx.commit()  # the read predicate recorded before the savepoint still protects
+        self.assertEqual(tx.state, "rolled_back")
+        self.assertEqual(self.engine.get("users", 1)["age"], 99)
+
     # ----------------------------------------------------------- audit/readonly
     def test_audit_and_read_only_view(self):
         self.add(1, "ann", 30)
