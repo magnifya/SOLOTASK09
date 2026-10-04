@@ -156,6 +156,19 @@ every committed page.
   transaction) raises `ConflictError`.  `begin(snapshot=txid)` lets a client
   pin an older snapshot for optimistic concurrency control; the HTTP API
   exposes it as `snapshot_txid`.
+* **Serializable isolation.** `Engine.begin(isolation="serializable")` (also
+  on `Engine.transaction` and as `isolation` in `POST /v1/tx`; it cannot be
+  combined with a pinned snapshot) reads the same snapshot but records every
+  read as a predicate: `get` protects one primary key (even a missing one),
+  `scan` the whole table, `index_get`/`index_range` the equality or range
+  bounds, and `query` the full matching range of all `where` predicates
+  regardless of projection, ordering, limit or access path.  At commit time
+  the writes of every transaction that committed after the reader started —
+  whatever its isolation level or start order — are replayed against those
+  predicates (row images before and after each write); a match raises
+  `ConflictError`, rolls the transaction back completely and terminates it.
+  Writes outside the protected ranges, the transaction's own writes and
+  uncommitted or rolled back writes never conflict.
 * Rows are version chains (`created`/`deleted` transaction ids).  Rolling back
   reverses the changes and drops the transaction's buffered pages.  Index
   entries of superseded versions are kept while other transactions are open
@@ -195,7 +208,7 @@ subclasses of `StorageError`.
 | POST | `/v1/tables/{table}/rows` | `{"rows":[...]}` | 201 `{"inserted":n,"lsn":n}` | 400, 404, 409 |
 | GET | `/v1/tables/{table}/rows/{pk}` | - | 200 row | 404 |
 | POST | `/v1/query` | `{"table","columns"?,"where"?,"index_hint"?,"limit"?,"order_by"?}` | 200 `{"rows":[...],"access":"index"\|"scan"}` | 400, 404 |
-| POST | `/v1/tx` | `{"ops":[{"op":"insert\|update\|delete","table","row"\|"pk","patch"}],"snapshot_txid"?}` | 200 `{"committed":true,"lsn":n,"txid":n}` | 400, 409 |
+| POST | `/v1/tx` | `{"ops":[{"op":"insert\|update\|delete","table","row"\|"pk","patch"}],"snapshot_txid"?,"isolation"?}` | 200 `{"committed":true,"lsn":n,"txid":n}` | 400, 409 |
 | GET | `/v1/verify` | - | 200 `{"pages":n,"wal_records":n,"crc_ok":bool,"ok":bool}` | - |
 | GET | `/v1/audit?limit=n` | - | 200 `{"entries":[...],"count":n}` | 400 |
 

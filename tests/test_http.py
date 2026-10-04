@@ -144,6 +144,35 @@ class HttpTests(unittest.TestCase):
         status, body = self.call("POST", "/v1/tx", {"ops": [{"op": "explode", "table": "users"}]})
         self.assertEqual(status, 400)
 
+    def test_tx_isolation_parameter(self):
+        self.create()
+        self.call("POST", "/v1/tables/users/rows", {"rows": [{"id": 1, "name": "ann", "age": 30}]})
+        old_txid = self.call("GET", "/v1/audit")[1]["entries"][-1]["txid"]
+        op = {"op": "update", "table": "users", "pk": 1, "patch": {"age": 31}}
+
+        status, body = self.call("POST", "/v1/tx", {"ops": [op], "isolation": "serializable"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["committed"])
+        status, body = self.call("POST", "/v1/tx", {"ops": [op], "isolation": "snapshot"})
+        self.assertEqual(status, 200)
+        status, body = self.call("POST", "/v1/tx", {"ops": [op]})
+        self.assertEqual(status, 200)
+
+        for bad in ("serial", "SERIALIZABLE", 5, True, ["snapshot"]):
+            status, body = self.call("POST", "/v1/tx", {"ops": [op], "isolation": bad})
+            self.assertEqual(status, 400)
+            self.assertIn("error", body)
+        status, body = self.call("POST", "/v1/tx", {
+            "ops": [op], "isolation": "serializable", "snapshot_txid": old_txid,
+        })
+        self.assertEqual(status, 400)
+        self.assertIn("error", body)
+        status, body = self.call("POST", "/v1/tx", {
+            "ops": [op], "isolation": "serializable", "snapshot_txid": None,
+        })
+        self.assertEqual(status, 200)  # a null snapshot_txid is no pinning
+        self.assertEqual(self.call("GET", "/v1/tables/users/rows/1")[1]["age"], 31)
+
     def test_verify_audit_and_error_shapes(self):
         self.create()
         self.call("POST", "/v1/tables/users/rows", {"rows": [{"id": 1, "name": "ann", "age": 30}]})

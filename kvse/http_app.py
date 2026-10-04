@@ -176,7 +176,9 @@ class Handler(BaseHTTPRequestHandler):
         ops = body.get("ops")
         if not isinstance(ops, list) or not ops:
             raise StorageError("body must contain a non-empty 'ops' array")
-        result = self.engine.transaction(ops, snapshot=body.get("snapshot_txid"))
+        result = self.engine.transaction(
+            ops, snapshot=body.get("snapshot_txid"), isolation=body.get("isolation")
+        )
         return self._send(200, result)
 
 

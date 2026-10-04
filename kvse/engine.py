@@ -16,6 +16,15 @@ use MVCC snapshot isolation: a transaction reads the newest version that was
 committed at or before the horizon it started with, so later commits stay
 invisible to it.  Writes are optimistic: touching a row that was written after
 the reader's snapshot raises :class:`ConflictError`.
+
+A transaction may also opt into ``serializable`` isolation.  It reads the same
+snapshot, but every read additionally records a predicate (a primary key, an
+index range, a ``where`` conjunction or a whole table).  At commit time the
+engine replays the writes of every transaction that committed after the reader
+started — regardless of that writer's isolation level or start order — and
+raises :class:`ConflictError` when any written row, before or after the write,
+matches a recorded predicate.  A conflicting serializable transaction is
+rolled back completely and cannot be used any more.
 """
 
 from __future__ import annotations
@@ -74,6 +83,8 @@ class Engine:
         self._horizon = 0
         self._base_horizon = 0
         self._next_txid = 1
+        self._commit_counter = 0
+        self._commit_seq = {}
         self.lsn = 0
 
     def _is_committed(self, txid):
@@ -149,6 +160,17 @@ class Engine:
         return None
 
     # ------------------------------------------------------------- read paths
+    def _record_read(self, tx, entry):
+        """Remember a read predicate of a serializable transaction.
+
+        Entries are ``("pk", table, pk)``, ``("range", table, column, low,
+        high)`` or ``("where", table, conds)`` with an empty ``conds`` meaning
+        the whole table.  Only successful reads are recorded, and only when
+        the caller is not suppressing recording (see ``Transaction.query``).
+        """
+        if tx.isolation == "serializable" and not tx._suppress:
+            tx._reads.append(entry)
+
     def _scan(self, tx, table):
         table_obj = self._table(table)
         rows = []
@@ -156,14 +178,15 @@ class Engine:
             version = self._visible(table_obj["rows"][pk], tx.txid, tx.snapshot)
             if version is not None:
                 rows.append(dict(version["values"]))
+        self._record_read(tx, ("where", table, ()))
         return rows
 
     def _get(self, tx, table, pk):
         table_obj = self._table(table)
-        versions = table_obj["rows"].get(self._coerce_pk(table_obj, pk))
-        if not versions:
-            return None
-        version = self._visible(versions, tx.txid, tx.snapshot)
+        pk = self._coerce_pk(table_obj, pk)
+        versions = table_obj["rows"].get(pk)
+        version = self._visible(versions, tx.txid, tx.snapshot) if versions else None
+        self._record_read(tx, ("pk", table, pk))
         return dict(version["values"]) if version is not None else None
 
     def _index_lookup(self, tx, table, column, low, high):
@@ -195,7 +218,66 @@ class Engine:
                 continue
             seen.add(pk)
             rows.append(dict(version["values"]))
+        self._record_read(tx, ("range", table, column, low, high))
         return rows
+
+    # -------------------------------------------------- serializable checking
+    def _predicate_matches(self, entry, values):
+        """True when a written row image falls inside a protected read range."""
+        if entry[0] == "where":
+            return all(query.compare(op, values.get(col), val) for col, op, val in entry[2])
+        _, _, column, low, high = entry
+        value = values.get(column)
+        if value is None:
+            return False  # null values are never part of an index range
+        try:
+            if low is not None and value < low:
+                return False
+            if high is not None and value > high:
+                return False
+        except TypeError:
+            return False
+        return True
+
+    def _check_read_conflicts(self, tx):
+        """Validate a serializable transaction against newer committed writes.
+
+        Every version written by a transaction that committed after ``tx``
+        started — whatever its isolation level or start order — is checked
+        against the predicates ``tx`` recorded while reading.  A write to a
+        protected primary key, or a written row whose image before or after
+        the write matches a protected predicate, is a read-write conflict.
+        """
+        by_table = {}
+        for entry in tx._reads:
+            by_table.setdefault(entry[1], []).append(entry)
+        for table, entries in by_table.items():
+            table_obj = self.tables.get(table)
+            if table_obj is None:
+                continue
+            protected_pks = {entry[2] for entry in entries if entry[0] == "pk"}
+            matchers = [entry for entry in entries if entry[0] != "pk"]
+            for pk, versions in table_obj["rows"].items():
+                for version in versions:
+                    newer = False
+                    for marker in (version["created"], version["deleted"]):
+                        if marker is None or marker == tx.txid:
+                            continue
+                        if self._commit_seq.get(marker, 0) > tx._commit_horizon:
+                            newer = True
+                            break
+                    if not newer:
+                        continue
+                    if pk in protected_pks:
+                        raise ConflictError(
+                            "key %r of table %s was written by a transaction "
+                            "that committed after transaction %d started" % (pk, table, tx.txid)
+                        )
+                    if any(self._predicate_matches(m, version["values"]) for m in matchers):
+                        raise ConflictError(
+                            "a transaction that committed after transaction %d started "
+                            "wrote rows matching its reads on table %s" % (tx.txid, table)
+                        )
 
     # ------------------------------------------------------------ write paths
     def _read_json(self, page_id):
@@ -547,7 +629,18 @@ class Engine:
         return dict(version["values"])
 
     # ------------------------------------------------------------ transactions
-    def _begin(self, snapshot=None):
+    def _resolve_isolation(self, isolation, snapshot):
+        """Validate the ``isolation``/``snapshot`` combination before any begin."""
+        if isolation is None:
+            isolation = "snapshot"
+        if not isinstance(isolation, str) or isolation not in ("snapshot", "serializable"):
+            raise StorageError("isolation must be 'snapshot' or 'serializable'")
+        if isolation == "serializable" and snapshot is not None:
+            raise StorageError("a serializable transaction cannot be pinned to a snapshot")
+        return isolation
+
+    def _begin(self, snapshot=None, isolation=None):
+        isolation = self._resolve_isolation(isolation, snapshot)
         if snapshot is not None:
             snapshot = int(snapshot)
             if snapshot < 0 or snapshot > self._horizon:
@@ -557,18 +650,25 @@ class Engine:
         txid = self._next_txid
         self._next_txid += 1
         self._open.add(txid)
-        return Transaction(self, txid, snapshot)
+        return Transaction(self, txid, snapshot, isolation)
 
-    def begin(self, snapshot=None):
-        """Start a write transaction, optionally pinned to an older snapshot."""
+    def begin(self, snapshot=None, isolation=None):
+        """Start a write transaction, optionally pinned to an older snapshot.
+
+        ``isolation`` is ``"snapshot"`` (the default) or ``"serializable"``;
+        the serializable mode validates reads at commit time and cannot be
+        combined with a pinned ``snapshot``.
+        """
         with self._lock:
-            return self._begin(snapshot)
+            return self._begin(snapshot, isolation)
 
     def _finish(self, tx, committed):
         """Retire a transaction; the last one out rebuilds the indexes."""
         self._open.discard(tx.txid)
         if committed:
             self._committed.add(tx.txid)
+            self._commit_counter += 1
+            self._commit_seq[tx.txid] = self._commit_counter
             if tx.txid > self._horizon:
                 self._horizon = tx.txid
         if not self._open:
@@ -608,10 +708,10 @@ class Engine:
                 tx.rollback()
                 raise
 
-    def transaction(self, ops, snapshot=None):
+    def transaction(self, ops, snapshot=None, isolation=None):
         """Apply a batch of operations in one transaction; roll back on error."""
         with self._lock:
-            tx = self._begin(snapshot)
+            tx = self._begin(snapshot, isolation)
             try:
                 for op in ops:
                     if not isinstance(op, dict):
@@ -628,7 +728,8 @@ class Engine:
                 lsn = tx.commit()
                 return {"committed": True, "lsn": lsn, "txid": tx.txid}
             except Exception:
-                tx.rollback()
+                if tx.state == "active":
+                    tx.rollback()
                 raise
 
     # ------------------------------------------------------------ read helpers
@@ -770,15 +871,19 @@ class Engine:
 
 
 class Transaction:
-    """A snapshot isolated transaction; read-only until it writes."""
+    """A snapshot or serializable transaction; read-only until it writes."""
 
-    def __init__(self, engine, txid, snapshot):
+    def __init__(self, engine, txid, snapshot, isolation="snapshot"):
         self.engine = engine
         self.txid = txid
         self.snapshot = snapshot
+        self.isolation = isolation
         self.state = "active"
         self.ops = []
         self._undo = []
+        self._reads = []
+        self._suppress = 0
+        self._commit_horizon = engine._commit_counter
 
     def __enter__(self):
         return self
@@ -835,10 +940,26 @@ class Transaction:
     def query(self, table, columns=None, where=None, index_hint=None, limit=None, order_by=None):
         self._check_active()
         with self.engine._lock:
-            return query.execute(
-                self, table, columns=columns, where=where, index_hint=index_hint,
-                limit=limit, order_by=order_by,
-            )
+            if self.isolation != "serializable":
+                return query.execute(
+                    self, table, columns=columns, where=where, index_hint=index_hint,
+                    limit=limit, order_by=order_by,
+                )
+            # A serializable query protects the full matching range of every
+            # where predicate; the access path, projection, ordering and limit
+            # must not narrow it, so the reads done by the executor itself are
+            # suppressed and the whole predicate is recorded once it succeeds.
+            conds = query.normalize_where(self, table, where)
+            self._suppress += 1
+            try:
+                result = query.execute(
+                    self, table, columns=columns, where=where, index_hint=index_hint,
+                    limit=limit, order_by=order_by,
+                )
+            finally:
+                self._suppress -= 1
+            self._reads.append(("where", table, tuple(conds)))
+            return result
 
     # -------------------------------------------------------------- lifecycle
     def commit(self):
@@ -847,6 +968,18 @@ class Transaction:
             if self.txid == 0:
                 raise StorageError("read-only snapshots cannot be committed")
             engine = self.engine
+            if self.isolation == "serializable":
+                try:
+                    engine._check_read_conflicts(self)
+                except ConflictError:
+                    # A read-write conflict rolls the transaction back for
+                    # good: undo row and index changes, write no audit record
+                    # and leave the committed lsn untouched.
+                    self._rollback_locked()
+                    engine.pager.abort(self.txid)
+                    self.state = "rolled_back"
+                    engine._finish(self, False)
+                    raise
             engine._committed.add(self.txid)
             if self.txid > engine._horizon:
                 engine._horizon = self.txid
