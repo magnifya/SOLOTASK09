@@ -25,7 +25,20 @@ started — regardless of that writer's isolation level or start order — and
 raises :class:`ConflictError` when any written row, before or after the write,
 matches a recorded predicate.  A conflicting serializable transaction is
 rolled back completely and cannot be used any more.
+
+Savepoints
+----------
+A transaction may mark named savepoints and later roll back to one of them,
+undoing only the writes made after that point while staying alive.  A
+savepoint is a bookmark into the transaction's undo and op logs, so rolling
+back replays the same undo callbacks a full rollback would, just fewer of
+them; read predicates recorded by a serializable transaction deliberately
+survive a partial rollback.  Savepoints are purely in-memory: they never
+touch the WAL, the lsn or the audit log, and nothing about them survives
+commit, rollback, restart or restore.
 """
+
+from __future__ import annotations
 
 from __future__ import annotations
 
@@ -53,6 +66,12 @@ class ConflictError(StorageError):
 
 class ConstraintError(StorageError):
     """Primary key, unique, nullability or type constraint violated."""
+
+
+def _check_savepoint_name(name):
+    """A savepoint name is a case-sensitive, non-blank string."""
+    if not isinstance(name, str) or not name.strip():
+        raise StorageError("savepoint name must be a non-empty, non-blank string")
 
 
 class Engine:
@@ -723,6 +742,12 @@ class Engine:
                         tx.update(op["table"], op.get("pk"), op.get("patch") or {})
                     elif kind == "delete":
                         tx.delete(op["table"], op.get("pk"))
+                    elif kind == "savepoint":
+                        tx.savepoint(op.get("name"))
+                    elif kind == "rollback_to":
+                        tx.rollback_to(op.get("name"))
+                    elif kind == "release_savepoint":
+                        tx.release_savepoint(op.get("name"))
                     else:
                         raise StorageError("unsupported op %r" % (kind,))
                 lsn = tx.commit()
@@ -882,6 +907,7 @@ class Transaction:
         self.ops = []
         self._undo = []
         self._reads = []
+        self._savepoints = []
         self._suppress = 0
         self._commit_horizon = engine._commit_counter
 
@@ -961,6 +987,63 @@ class Transaction:
             self._reads.append(("where", table, tuple(conds)))
             return result
 
+    # -------------------------------------------------------------- savepoints
+    def savepoint(self, name):
+        """Mark a named point this transaction can later roll back to.
+
+        Names are case-sensitive and live only inside this transaction; a
+        name freed by ``rollback_to`` or ``release_savepoint`` may be reused.
+        """
+        self._check_active()
+        with self.engine._lock:
+            _check_savepoint_name(name)
+            if any(sp["name"] == name for sp in self._savepoints):
+                raise StorageError(
+                    "savepoint %r already exists in transaction %d" % (name, self.txid)
+                )
+            self._savepoints.append({
+                "name": name,
+                "undo": len(self._undo),
+                "ops": len(self.ops),
+            })
+            return True
+
+    def rollback_to(self, name):
+        """Undo every write made after ``name`` was created; keep it and the
+        earlier savepoints, invalidate the later ones.
+
+        Read predicates already recorded by a serializable transaction stay
+        protected even when the writes around them are undone.
+        """
+        self._check_active()
+        with self.engine._lock:
+            index = self._find_savepoint(name)
+            target = self._savepoints[index]
+            while len(self._undo) > target["undo"]:
+                self._undo.pop()()
+            del self.ops[target["ops"]:]
+            del self._savepoints[index + 1:]
+            return True
+
+    def release_savepoint(self, name):
+        """Forget ``name`` and every savepoint created after it.
+
+        Nothing is undone and nothing is committed: the writes stay exactly
+        as they are and a full ``rollback`` still undoes all of them.
+        """
+        self._check_active()
+        with self.engine._lock:
+            index = self._find_savepoint(name)
+            del self._savepoints[index:]
+            return True
+
+    def _find_savepoint(self, name):
+        _check_savepoint_name(name)
+        for index, sp in enumerate(self._savepoints):
+            if sp["name"] == name:
+                return index
+        raise StorageError("unknown savepoint %r in transaction %d" % (name, self.txid))
+
     # -------------------------------------------------------------- lifecycle
     def commit(self):
         with self.engine._lock:
@@ -992,6 +1075,7 @@ class Transaction:
                 raise
             self.state = "committed"
             self._undo = []
+            self._savepoints = []
             engine._finish(self, True)
             return lsn
 
@@ -1009,6 +1093,7 @@ class Transaction:
         while self._undo:
             self._undo.pop()()
         self.ops = []
+        self._savepoints = []
 
 
 class ReadOnlyView:

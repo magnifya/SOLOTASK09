@@ -174,6 +174,19 @@ every committed page.
   entries of superseded versions are kept while other transactions are open
   and rebuilt from the live versions as soon as the last writer finishes, so
   an index scan stays correct for older snapshots.
+* **Savepoints.** `tx.savepoint(name)` marks a named point inside an active
+  transaction, `tx.rollback_to(name)` undoes every write made after it
+  (inserts, updates, deletes, including primary key and unique occupancy)
+  while the transaction stays alive, and `tx.release_savepoint(name)` forgets
+  a savepoint without undoing anything.  Rolling back to a savepoint keeps
+  the target and the earlier savepoints and invalidates the later ones;
+  releasing removes the target and everything after it.  Names are
+  case-sensitive, must be non-blank strings and live only inside their
+  transaction; a freed name may be reused.  Savepoints never touch the WAL,
+  the lsn or the audit log, serializable read predicates recorded before or
+  inside a rolled-back region stay protected, and nothing about them survives
+  commit, rollback, restart or restore.  `Engine.transaction` and
+  `POST /v1/tx` accept them as `{"op":"savepoint"|"rollback_to"|"release_savepoint","name"}`.
 * Durability: a commit is acknowledged only after the WAL commit marker is
   fsynced and the pages are applied.  `reopen()` (or constructing a new
   `Engine` on the same directory) replays the WAL and returns exactly the
@@ -208,7 +221,7 @@ subclasses of `StorageError`.
 | POST | `/v1/tables/{table}/rows` | `{"rows":[...]}` | 201 `{"inserted":n,"lsn":n}` | 400, 404, 409 |
 | GET | `/v1/tables/{table}/rows/{pk}` | - | 200 row | 404 |
 | POST | `/v1/query` | `{"table","columns"?,"where"?,"index_hint"?,"limit"?,"order_by"?}` | 200 `{"rows":[...],"access":"index"\|"scan"}` | 400, 404 |
-| POST | `/v1/tx` | `{"ops":[{"op":"insert\|update\|delete","table","row"\|"pk","patch"}],"snapshot_txid"?,"isolation"?}` | 200 `{"committed":true,"lsn":n,"txid":n}` | 400, 409 |
+| POST | `/v1/tx` | `{"ops":[{"op":"insert\|update\|delete","table","row"\|"pk","patch"} \| {"op":"savepoint\|rollback_to\|release_savepoint","name"}],"snapshot_txid"?,"isolation"?}` | 200 `{"committed":true,"lsn":n,"txid":n}` | 400, 409 |
 | GET | `/v1/verify` | - | 200 `{"pages":n,"wal_records":n,"crc_ok":bool,"ok":bool}` | - |
 | GET | `/v1/audit?limit=n` | - | 200 `{"entries":[...],"count":n}` | 400 |
 
@@ -252,6 +265,9 @@ python3 -m unittest discover -s tests -v
   views.
 * `tests/test_http.py` - the whole HTTP surface on an ephemeral port,
   including 404/400/409 error shapes and a restart.
+* `tests/test_savepoints.py` - named savepoints: partial rollback of row and
+  index writes, name validation and invalidation, release semantics, lsn and
+  audit neutrality, serializable predicate survival, batch and HTTP ops.
 
 ## Not implemented yet (next steps for the lane)
 
