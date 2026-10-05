@@ -798,6 +798,12 @@ class Engine:
     def readonly_view(self):
         return ReadOnlyView(self)
 
+    def create_replica(self, replica_dir):
+        """Build an initial persistent read-only replica in ``replica_dir``."""
+        from .replica import Replica
+
+        return Replica.create(self, replica_dir)
+
     # -------------------------------------------------- recovery and integrity
     def reopen(self):
         """Simulate a restart: drop memory, replay the WAL, reload the state."""

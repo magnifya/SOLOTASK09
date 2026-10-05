@@ -13,8 +13,9 @@ This seed already implements the storage and transaction core of that list:
 a checksummed 4096 byte page store, a redo write-ahead log with torn-tail
 tolerance, single-writer MVCC transactions with snapshot isolation,
 primary/unique/not-null/type constraints, secondary indexes, a small query
-subset, crash recovery, auditing, read-only views and snapshot backup with
-point-in-time restore.
+subset, crash recovery, auditing, read-only views, snapshot backup with
+point-in-time restore, and persistent read-only replicas with consistent,
+lsn-pinned read sessions.
 
 ## Requirements
 
@@ -48,7 +49,7 @@ python3 -m kvse --data-dir ./kvse_data tx-demo
 a row object or an array of row objects.
 
 ```python
-from kvse import Engine, StorageError
+from kvse import Engine, Replica, StorageError
 
 engine = Engine("./kvse_data")
 engine.create_table(
@@ -64,6 +65,14 @@ tx.insert("items", {"id": 1, "label": "alpha", "qty": 5})
 tx.commit()                       # or tx.rollback()
 engine.query("items", where=[("qty", ">=", 5)], order_by="id")
 engine.explain("items", where=[("qty", ">=", 5)])   # {"access": "index", ...}
+
+# a persistent read-only replica living in its own directory
+replica = engine.create_replica("./kvse_replica")   # or Replica.create(engine, dir)
+# replica.source_id, replica.applied_lsn describe the initial copy
+engine.insert("items", {"id": 2, "label": "beta", "qty": 9})
+replica.sync()                    # catch up to the latest commit boundary
+replica.sync(target_lsn=lsn)      # or stop exactly at one committed lsn
+session = replica.read_session()  # pin reads to the current boundary
 ```
 
 ## Layout
@@ -73,11 +82,13 @@ kvse/__init__.py   public API: Engine, Transaction, StorageError
 kvse/pager.py      fixed size page file, crc32 headers, WAL append/replay/checkpoint
 kvse/engine.py     catalog, MVCC rows, transactions, indexes, constraints,
                    recovery, backup/restore, audit, read-only view
+kvse/replica.py    persistent read-only replicas: directory/engine sources,
+                   atomic boundary sync, lsn-pinned read sessions
 kvse/query.py      query subset: scan / point get / index range + explain
 kvse/http_app.py   ThreadingHTTPServer + create_server(engine, host, port)
 kvse/cli.py        serve, create-table, insert, get, query, verify, tx-demo
 kvse/__main__.py   python3 -m kvse entry point
-tests/             unittest suite for pager, engine and HTTP API
+tests/             unittest suite for pager, engine, replicas and HTTP API
 ```
 
 ## On-disk format
@@ -249,6 +260,64 @@ Every commit appends `{"lsn","txid","at","ops":[...]}` to the audit log
 makes tests deterministic.  `engine.readonly_view()` returns a handle that
 serves reads and refuses writes.
 
+## Read-only replicas
+
+```python
+replica = Replica.create(engine, "./replica")    # or Replica.create("./kvse_data", "./replica")
+replica.source_id          # real path of the primary directory
+replica.applied_lsn        # commit boundary the initial copy stopped at
+replica.sync()             # follow to the latest complete commit boundary
+replica.sync(target_lsn=lsn)
+old = Replica.open("./replica")   # reopen after a restart; applied_lsn persists
+session = replica.read_session()  # pin to the current boundary
+stale = replica.read_session(lsn) # or to any retained applied boundary
+```
+
+A replica is a fully independent database directory: it keeps its own page
+file, WAL prefix, audit log and rebuilt index state under
+`replica.json` + `gen-gN/` generation directories.  The primary never writes
+there, and nothing on the replica can write back to the primary.  Existing
+primary directories need no migration; the source may be handed in as a live
+`Engine` (copied under the write lock) or as a plain path (copied only once
+two consecutive samples agree, so a commit landing mid-copy never mixes into
+the result).
+
+* **Sync boundaries.** `sync()` applies committed source records in commit
+  order and switches the replica's visible state once, when the new
+  generation is fully rebuilt.  Without a target it stops at the newest
+  complete commit boundary visible when the call starts; commits that land
+  during the sync are not part of its result.  An explicit `target_lsn` must
+  be a committed lsn the source still retains, not newer than the source
+  history and not older than the replica's `applied_lsn`.
+* **Atomic failure.** Invalid source/replica paths, incompatible formats,
+  page or WAL checksum failures, a missing commit record, a target beyond the
+  available history or a target that is not a commit boundary all raise
+  `StorageError`.  The new generation is built in its own directory and
+  published by atomically replacing `replica.json`; on any error the staging
+  material is discarded and the previous data and `applied_lsn` are
+  untouched.  After a restart the applied lsn is read back and the next sync
+  continues from the following boundary.
+* **History and checkpoints.** A replica carries the WAL prefix it applied,
+  so earlier commit boundaries stay available for pinned sessions until the
+  primary truncates that history with `checkpoint()`.  If the primary
+  checkpoints and restarts so its lsn sequence rewinds past the replica's
+  applied lsn, the source can no longer be followed and `sync()` raises
+  `StorageError`; create a fresh replica from the new image instead.  Syncing
+  to a boundary the source no longer retains is rejected the same way.
+* **Read parity.** `get`, `scan`, `index_get`, `index_range`, `query`,
+  `explain`, `audit`, `verify`, `table_info`/`list_tables`/`has_table` and
+  `readonly_view` behave exactly like the engine at the applied boundary,
+  including predicate validation and access path choice.
+* **Read sessions.** `read_session(lsn=None)` returns a handle pinned to one
+  applied commit boundary; it keeps serving that boundary after later syncs
+  (its generation directory is retained until the session closes) and is
+  usable as a context manager.  An lsn above the replica's current boundary,
+  or one that is not a retained commit boundary, raises `StorageError`.
+* **No writes.** `insert`, `update`, `delete`, `create_table`,
+  `create_index`, `begin`, `transaction`, `commit`, `rollback`, `restore`
+  (and `backup`) raise `StorageError` on both the replica and its sessions,
+  before any WAL or audit record could be written.
+
 ## Verification and tests
 
 ```bash
@@ -263,6 +332,11 @@ python3 -m unittest discover -s tests -v
   index maintenance, the query subset and access path choice, recovery after
   a simulated crash, backup and point-in-time restore, audit and read-only
   views.
+* `tests/test_replica.py` - initial replica from an engine and from a
+  directory, ordered boundary syncs, target validation and all-or-nothing
+  failure, applied-lsn persistence and continued catch-up, pinned read
+  sessions across syncs, read/query/explain parity, write refusal without
+  WAL/audit writes, corrupt page/WAL rejection, checkpointed sources.
 * `tests/test_http.py` - the whole HTTP surface on an ephemeral port,
   including 404/400/409 error shapes and a restart.
 * `tests/test_savepoints.py` - named savepoints: partial rollback of row and
@@ -274,5 +348,6 @@ python3 -m unittest discover -s tests -v
 B+ tree on-disk indexes with page splits, multi-column and covering indexes,
 joins/aggregates/ORDER BY pushdown, constraints beyond the four listed above,
 triggers, multi-process concurrency with a redo/undo WAL and lock manager,
-fuzzy checkpoints and WAL archiving, consistent read-only replicas,
-authentication, privileges and audit retention policies.
+fuzzy checkpoints and WAL archiving, inter-process replica transport
+(network/streaming fetch instead of local file copying), authentication,
+privileges and audit retention policies.

@@ -11,7 +11,14 @@ Public entry points:
 
 from .engine import ConflictError, ConstraintError, Engine, ReadOnlyView, Transaction
 from .pager import PAGE_SIZE, Pager, StorageError
+from .replica import Replica, ReplicaSession
 
 __version__ = "0.1.0"
 
-__all__ = ["Engine", "Transaction", "StorageError"]
+__all__ = [
+    "Engine",
+    "Replica",
+    "ReplicaSession",
+    "StorageError",
+    "Transaction",
+]
