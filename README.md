@@ -13,8 +13,9 @@ This seed already implements the storage and transaction core of that list:
 a checksummed 4096 byte page store, a redo write-ahead log with torn-tail
 tolerance, single-writer MVCC transactions with snapshot isolation,
 primary/unique/not-null/type constraints, secondary indexes, a small query
-subset, crash recovery, auditing, read-only views and snapshot backup with
-point-in-time restore.
+subset, crash recovery, auditing, read-only views, snapshot backup with
+point-in-time restore, and disk-backed read-only replicas with consistent
+reads.
 
 ## Requirements
 
@@ -69,15 +70,16 @@ engine.explain("items", where=[("qty", ">=", 5)])   # {"access": "index", ...}
 ## Layout
 
 ```
-kvse/__init__.py   public API: Engine, Transaction, StorageError
+kvse/__init__.py   public API: Engine, Transaction, StorageError, Replica
 kvse/pager.py      fixed size page file, crc32 headers, WAL append/replay/checkpoint
 kvse/engine.py     catalog, MVCC rows, transactions, indexes, constraints,
                    recovery, backup/restore, audit, read-only view
+kvse/replica.py    disk-backed read-only replicas: create, sync, pinned read sessions
 kvse/query.py      query subset: scan / point get / index range + explain
 kvse/http_app.py   ThreadingHTTPServer + create_server(engine, host, port)
 kvse/cli.py        serve, create-table, insert, get, query, verify, tx-demo
 kvse/__main__.py   python3 -m kvse entry point
-tests/             unittest suite for pager, engine and HTTP API
+tests/             unittest suite for pager, engine, replicas and HTTP API
 ```
 
 ## On-disk format
@@ -249,6 +251,49 @@ Every commit appends `{"lsn","txid","at","ops":[...]}` to the audit log
 makes tests deterministic.  `engine.readonly_view()` returns a handle that
 serves reads and refuses writes.
 
+## Read-only replicas
+
+```python
+from kvse import Engine, Replica
+
+replica = Replica.create(engine, "./kvse_replica")   # or a source directory path
+replica.source          # identity (directory) of the primary
+replica.applied_lsn     # newest commit lsn the replica has applied
+replica.sync()          # catch up to the newest complete commit boundary
+replica.sync(lsn)       # or to an exact committed lsn the source still provides
+session = replica.read_session(lsn)   # pinned consistent reads at one boundary
+```
+
+`Replica.create(source, root)` builds the initial replica of any existing
+data directory (no migration needed) and returns a `Replica` exposing the
+source identity and the applied commit lsn.  The replica directory holds its
+own `data.pages`, `wal.log`, audit and index state plus a small
+`replica.json`; the source is only ever read, so a replica can never modify
+its primary.
+
+`sync(target_lsn=None)` snapshots the source WAL once at call time — commits
+the source finishes afterwards are not part of that sync — validates the
+records up to the target commit boundary, builds the new page image in a
+scratch directory and swaps it into place in one step.  An invalid source or
+replica path, an incompatible format, a page or WAL checksum failure,
+missing commit records (e.g. after `checkpoint()`), a target beyond the
+available history or a target that is not a commit boundary all raise
+`StorageError` before anything changes, so a failed sync leaves the
+replica's data and `applied_lsn` untouched.  A restarted replica
+(`Replica(root)`) keeps its `applied_lsn` and continues from the next
+commit boundary.
+
+A replica serves the same reads as an engine — `get`, `scan`, `index_get`,
+`index_range`, `query`, `explain`, `audit` and `verify` (plus
+`list_tables`/`has_table`/`table_info`) — with identical results, predicate
+handling and query access markers.  `read_session(lsn=None)` pins one
+applied commit lsn in a private copy: later syncs stay invisible to the
+session, and asking for an lsn beyond the replica's applied boundary raises
+`StorageError`.  Every write or commit operation on a replica or a session
+(`insert`, `update`, `delete`, `create_table`, `create_index`,
+`transaction`, `begin`, `restore`, `checkpoint`, `commit`) raises
+`StorageError` without producing WAL or audit records.
+
 ## Verification and tests
 
 ```bash
@@ -263,6 +308,10 @@ python3 -m unittest discover -s tests -v
   index maintenance, the query subset and access path choice, recovery after
   a simulated crash, backup and point-in-time restore, audit and read-only
   views.
+* `tests/test_replica.py` - replica creation and identity, independent
+  on-disk state, sync with and without a target, error cases that must not
+  change the replica, restart catch-up, pinned read sessions and write
+  refusals.
 * `tests/test_http.py` - the whole HTTP surface on an ephemeral port,
   including 404/400/409 error shapes and a restart.
 * `tests/test_savepoints.py` - named savepoints: partial rollback of row and
@@ -274,5 +323,5 @@ python3 -m unittest discover -s tests -v
 B+ tree on-disk indexes with page splits, multi-column and covering indexes,
 joins/aggregates/ORDER BY pushdown, constraints beyond the four listed above,
 triggers, multi-process concurrency with a redo/undo WAL and lock manager,
-fuzzy checkpoints and WAL archiving, consistent read-only replicas,
+fuzzy checkpoints and WAL archiving, streaming replica catch-up,
 authentication, privileges and audit retention policies.
