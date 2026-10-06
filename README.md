@@ -45,8 +45,8 @@ python3 -m kvse --data-dir ./kvse_data verify
 python3 -m kvse --data-dir ./kvse_data tx-demo
 ```
 
-`table.json` is `{"name", "columns", "primary_key", "indexes"}`; `rows.json` is
-a row object or an array of row objects.
+`table.json` is `{"name", "columns", "primary_key", "indexes", "checks"}`;
+`rows.json` is a row object or an array of row objects.
 
 ```python
 from kvse import Engine, Replica, StorageError
@@ -121,7 +121,8 @@ page 0            meta: {"format":"kvse-state-1","lsn","txid","audit_page",
                          "state_len","next_txid","horizon"}
 page 1..1+a-1     audit log chunks: [{"lsn","txid","at","ops":[...]}, ...]
 page 1+a..+s-1    state chunks: {"format":"kvse-db-1","tables":{name: {
-                         "columns","primary_key","indexes","rows":[[pk, values]]}},
+                         "columns","primary_key","indexes","checks",
+                         "rows":[[pk, values]]}},
                          "index_refs":[{"table","column","root","entries",
                          "height"}, ...]}
 page 1+a+s..      B+ tree index pages, one page per node
@@ -245,6 +246,7 @@ every committed page.
 | `unique: true` | no two live rows may share a non-null value; enforced on insert and update |
 | `nullable: false` | the column must be present and non-null |
 | `references: {"table","column"}` | foreign key to another table's primary key of the same type; a non-null value must resolve to a visible parent row on insert/update, a still-referenced parent row cannot be deleted, and both checks are repeated at commit — a violation rolls the whole transaction back |
+| `checks: [{"name","predicates"}]` | row-level CHECK constraints: each has a non-empty, per-table unique name and at least one `where`-form predicate (`=`,`!=`,`<`,`<=`,`>`,`>=`, table columns only, type-matched constants); predicates are ANDed, `=`/`!=` compare null directly, the rest are true only for non-null sides; enforced on insert/update (transaction stays usable) and again at commit (a violation rolls the whole transaction back); persisted in the state snapshot and re-validated on reopen, recovery, restore and replica sync |
 | type | `int` (bool rejected), `text` (str only), `bool` (bool only) |
 | unknown column | rejected on insert, update and in query predicates |
 | table/column definition | name, duplicate columns, primary key and index columns are validated at `create_table` |
@@ -262,7 +264,7 @@ subclasses of `StorageError`.
 | Method | Path | Body / query | Success | Errors |
 | --- | --- | --- | --- | --- |
 | GET | `/healthz` | - | 200 `{"ok": true}` | - |
-| POST | `/v1/tables` | `{"name","columns","primary_key","indexes"?}` | 201 table info | 400 |
+| POST | `/v1/tables` | `{"name","columns","primary_key","indexes"?,"checks"?}` | 201 table info | 400 |
 | GET | `/v1/tables` | - | 200 `{"tables":[...]}` | - |
 | POST | `/v1/tables/{table}/rows` | `{"rows":[...]}` | 201 `{"inserted":n,"lsn":n}` | 400, 404, 409 |
 | GET | `/v1/tables/{table}/rows/{pk}` | - | 200 row | 404 |
@@ -381,6 +383,12 @@ python3 -m unittest discover -s tests -v
 * `tests/test_savepoints.py` - named savepoints: partial rollback of row and
   index writes, name validation and invalidation, release semantics, lsn and
   audit neutrality, serializable predicate survival, batch and HTTP ops.
+* `tests/test_checks.py` - CHECK constraints: definition validation and
+  normalization, null semantics of the comparison operators, insert/update
+  enforcement with a still-usable transaction, commit-time revalidation with
+  full rollback, savepoint interaction, persistence across reopen, old images
+  without checks, corrupt/violating loaded state, backup/restore, replica
+  sync and the HTTP surface.
 
 ## Not implemented yet (next steps for the lane)
 
