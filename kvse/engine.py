@@ -36,6 +36,23 @@ them; read predicates recorded by a serializable transaction deliberately
 survive a partial rollback.  Savepoints are purely in-memory: they never
 touch the WAL, the lsn or the audit log, and nothing about them survives
 commit, rollback, restart or restore.
+
+Foreign keys
+------------
+A column may carry a ``references`` object ``{"table": T, "column": C}``
+naming another table's primary key; the definition is validated when the
+table is created and persisted with the catalog.  A null foreign key value
+never looks anything up; a non-null value must resolve to a parent row
+visible in the transaction's own snapshot (which includes its earlier
+writes), and a parent row cannot be deleted while a visible child row still
+references it.  Because a concurrent commit can invalidate either check
+after it ran, both are repeated at commit time against the newest committed
+state; a violation raises :class:`ConstraintError` and rolls the whole
+transaction back — no rows, index entries, WAL pages, commit marker, lsn
+movement or audit record survive.  Loaded state (reopen, recovery, restore,
+replica sync) is validated the same way and rejected with
+:class:`StorageError` when a definition or a dangling row does not check
+out.
 """
 
 from __future__ import annotations
@@ -45,6 +62,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import tempfile
 import threading
 import time
 from bisect import bisect_left, insort
@@ -127,11 +145,18 @@ class Engine:
             table = self._table(name)
             return {
                 "name": name,
-                "columns": [dict(col) for col in table["columns"]],
+                "columns": [self._column_info(col) for col in table["columns"]],
                 "primary_key": table["primary_key"],
                 "indexes": dict(table["indexes"]),
                 "rows": len(table["rows"]),
             }
+
+    @staticmethod
+    def _column_info(column):
+        info = dict(column)
+        if info.get("references") is not None:
+            info["references"] = dict(info["references"])
+        return info
 
     def _reader(self):
         """Pseudo transaction used for engine level reads (txid 0 writes nothing)."""
@@ -337,6 +362,65 @@ class Engine:
             self._rebuild_indexes(table)
         audit_blob = self._read_pages(meta["audit_page"], meta["audit_pages"], meta["audit_len"])
         self._audit = json.loads(audit_blob.decode("utf-8")) if audit_blob else []
+        self._validate_foreign_keys()
+
+    def _validate_foreign_keys(self):
+        """Reject loaded state whose foreign keys do not hold.
+
+        Every ``references`` entry must name an existing table's primary key
+        of the same type, and every non-null foreign key value in a visible
+        row must resolve to a visible parent row.  Anything else means the
+        state on disk is not one this engine could have committed, so it is
+        refused with :class:`StorageError`.
+        """
+        for name, table in self.tables.items():
+            for column in table["columns"]:
+                ref = column.get("references")
+                if ref is None:
+                    continue
+                if not isinstance(ref, dict) or set(ref) != {"table", "column"}:
+                    raise StorageError(
+                        "table %s column %s has a malformed references entry"
+                        % (name, column["name"])
+                    )
+                parent = self.tables.get(ref["table"])
+                if parent is None:
+                    raise StorageError(
+                        "table %s column %s references unknown table %s"
+                        % (name, column["name"], ref["table"])
+                    )
+                if ref["column"] != parent["primary_key"]:
+                    raise StorageError(
+                        "table %s column %s references %s.%s, which is not the primary key"
+                        % (name, column["name"], ref["table"], ref["column"])
+                    )
+                pk_column = [c for c in parent["columns"] if c["name"] == parent["primary_key"]][0]
+                if pk_column["type"] != column["type"]:
+                    raise StorageError(
+                        "table %s column %s has type %s but references %s.%s of type %s"
+                        % (name, column["name"], column["type"],
+                           ref["table"], ref["column"], pk_column["type"])
+                    )
+        for name, table in self.tables.items():
+            fk_columns = [c for c in table["columns"] if c.get("references") is not None]
+            if not fk_columns:
+                continue
+            for pk, versions in table["rows"].items():
+                version = self._visible(versions, None, self._horizon)
+                if version is None:
+                    continue
+                for column in fk_columns:
+                    value = version["values"].get(column["name"])
+                    if value is None:
+                        continue
+                    parent = self.tables[column["references"]["table"]]
+                    parent_versions = parent["rows"].get(value)
+                    found = self._visible(parent_versions, None, self._horizon) if parent_versions else None
+                    if found is None:
+                        raise StorageError(
+                            "table %s row %r has a dangling reference: no row %r in table %s"
+                            % (name, pk, value, column["references"]["table"])
+                        )
 
     def _write_chunks(self, txid, first_page, blob):
         size = self.pager.payload_size
@@ -412,6 +496,8 @@ class Engine:
             for flag in ("nullable", "unique"):
                 if flag in column and not isinstance(column[flag], bool):
                     raise StorageError("column %s: %s must be a boolean" % (cname, flag))
+            if "references" in column:
+                self._check_reference(name, column, column["references"])
         if primary_key not in seen:
             raise StorageError("primary key %r is not a column of table %s" % (primary_key, name))
         if indexes is None:
@@ -422,6 +508,37 @@ class Engine:
             if column not in seen:
                 raise StorageError("index column %r is not a column of table %s" % (column, name))
 
+    def _check_reference(self, table, column, ref):
+        """Validate one ``references`` object against the existing catalog."""
+        cname = column["name"]
+        if not isinstance(ref, dict) or set(ref) != {"table", "column"}:
+            raise StorageError(
+                "column %s of table %s: references must be an object "
+                "with exactly 'table' and 'column'" % (cname, table)
+            )
+        target_name = ref["table"]
+        target_column = ref["column"]
+        if not isinstance(target_name, str) or not target_name.strip():
+            raise StorageError("column %s of table %s: references.table must be a non-empty string" % (cname, table))
+        if not isinstance(target_column, str) or not target_column.strip():
+            raise StorageError("column %s of table %s: references.column must be a non-empty string" % (cname, table))
+        target = self.tables.get(target_name)
+        if target is None:
+            raise StorageError(
+                "column %s of table %s references unknown table %s" % (cname, table, target_name)
+            )
+        if target_column != target["primary_key"]:
+            raise StorageError(
+                "column %s of table %s references %s.%s, which is not the primary key"
+                % (cname, table, target_name, target_column)
+            )
+        pk_column = [c for c in target["columns"] if c["name"] == target["primary_key"]][0]
+        if pk_column["type"] != column["type"]:
+            raise StorageError(
+                "column %s of table %s has type %s but references %s.%s of type %s"
+                % (cname, table, column["type"], target_name, target_column, pk_column["type"])
+            )
+
     def create_table(self, name, columns, primary_key, indexes=None):
         with self._lock:
             self._check_definition(name, columns, primary_key, indexes)
@@ -431,12 +548,18 @@ class Engine:
             try:
                 catalog = []
                 for column in columns:
-                    catalog.append({
+                    entry = {
                         "name": column["name"],
                         "type": column["type"],
                         "nullable": False if column["name"] == primary_key else bool(column.get("nullable", True)),
                         "unique": True if column["name"] == primary_key else bool(column.get("unique", False)),
-                    })
+                    }
+                    if column.get("references") is not None:
+                        entry["references"] = {
+                            "table": column["references"]["table"],
+                            "column": column["references"]["column"],
+                        }
+                    catalog.append(entry)
                 self.tables[name] = {
                     "name": name,
                     "columns": catalog,
@@ -571,6 +694,104 @@ class Engine:
                         "concurrent write on unique column %s.%s" % (table["name"], name)
                     )
 
+    # ---------------------------------------------------------- foreign keys
+    def _fk_visible(self, versions, txid, horizon):
+        """Visibility for foreign key checks.
+
+        Unlike :meth:`_visible` (which keeps a version readable to the
+        transaction that deleted it, so an update chain stays readable), a
+        row this transaction deleted no longer counts here: it will not be
+        part of the committed state, so it can neither satisfy a child
+        reference nor keep a parent alive.
+        """
+        best = None
+        for version in versions:
+            created = version["created"]
+            deleted = version["deleted"]
+            if created != txid and not (self._is_committed(created) and created <= horizon):
+                continue
+            if deleted is None:
+                best = version
+            elif deleted != txid and not (self._is_committed(deleted) and deleted <= horizon):
+                best = version
+        return best
+
+    def _referrers(self, table_name):
+        """``(child_table, column)`` pairs whose foreign key targets ``table_name``."""
+        found = []
+        for child_name, child in self.tables.items():
+            for column in child["columns"]:
+                ref = column.get("references")
+                if ref is not None and ref["table"] == table_name:
+                    found.append((child_name, column["name"]))
+        return found
+
+    def _check_fk_values(self, tx, table, values):
+        """Every non-null foreign key value must resolve in this transaction's view."""
+        for column in table["columns"]:
+            ref = column.get("references")
+            if ref is None:
+                continue
+            value = values.get(column["name"])
+            if value is None:
+                continue
+            parent = self.tables[ref["table"]]
+            versions = parent["rows"].get(value)
+            version = self._fk_visible(versions, tx.txid, tx.snapshot) if versions else None
+            if version is None:
+                raise ConstraintError(
+                    "foreign key violation on %s.%s: no row %r in table %s"
+                    % (table["name"], column["name"], value, ref["table"])
+                )
+
+    def _check_fk_delete(self, tx, table_name, pk):
+        """A parent row cannot be deleted while a visible child references it."""
+        for child_name, column_name in self._referrers(table_name):
+            child = self.tables[child_name]
+            for versions in child["rows"].values():
+                version = self._fk_visible(versions, tx.txid, tx.snapshot)
+                if version is not None and version["values"].get(column_name) == pk:
+                    raise ConstraintError(
+                        "foreign key violation: row %r of table %s is still "
+                        "referenced by %s.%s" % (pk, table_name, child_name, column_name)
+                    )
+
+    def _record_fk_refs(self, tx, table, values):
+        for column in table["columns"]:
+            ref = column.get("references")
+            if ref is not None:
+                value = values.get(column["name"])
+                if value is not None:
+                    tx._fk_refs.append((ref["table"], value))
+
+    def _check_foreign_keys(self, tx):
+        """Re-validate a committing transaction's foreign key effects.
+
+        A concurrent transaction may have committed after the per-operation
+        checks ran — deleting a parent this transaction referenced, or
+        inserting a child that references a parent it deleted.  Replaying the
+        checks against the newest committed state (plus this transaction's
+        own writes) keeps a commit from leaving a dangling reference behind.
+        """
+        for parent_name, pk in tx._fk_refs:
+            parent = self.tables.get(parent_name)
+            versions = parent["rows"].get(pk) if parent is not None else None
+            version = self._fk_visible(versions, tx.txid, self._horizon) if versions else None
+            if version is None:
+                raise ConstraintError(
+                    "foreign key violation: no row %r in table %s at commit" % (pk, parent_name)
+                )
+        for parent_name, pk in tx._fk_dels:
+            for child_name, column_name in self._referrers(parent_name):
+                child = self.tables[child_name]
+                for versions in child["rows"].values():
+                    version = self._fk_visible(versions, tx.txid, self._horizon)
+                    if version is not None and version["values"].get(column_name) == pk:
+                        raise ConstraintError(
+                            "foreign key violation: row %r of table %s is still "
+                            "referenced by %s.%s" % (pk, parent_name, child_name, column_name)
+                        )
+
     def _insert(self, tx, table, row):
         table_obj = self._table(table)
         values = self._build_values(table_obj, row, None)
@@ -581,6 +802,7 @@ class Engine:
         if self._conflicting_writes(versions, tx) is not None:
             raise ConflictError("primary key %r in table %s is written by another transaction" % (pk, table))
         self._check_unique(tx, table_obj, values, None)
+        self._check_fk_values(tx, table_obj, values)
         version = {"created": tx.txid, "deleted": None, "values": values}
         table_obj["rows"].setdefault(pk, []).append(version)
         self._index_add(table, values)
@@ -593,6 +815,7 @@ class Engine:
                 table_obj["rows"].pop(pk, None)
 
         tx._undo.append(undo)
+        self._record_fk_refs(tx, table_obj, values)
         tx.ops.append({"op": "insert", "table": table, "pk": pk, "row": values})
         return dict(values)
 
@@ -613,6 +836,7 @@ class Engine:
         if values[table_obj["primary_key"]] != pk:
             raise ConstraintError("primary key of %s may not be updated" % table)
         self._check_unique(tx, table_obj, values, pk)
+        self._check_fk_values(tx, table_obj, values)
         version["deleted"] = tx.txid
         new_version = {"created": tx.txid, "deleted": None, "values": values}
         versions.append(new_version)
@@ -624,6 +848,7 @@ class Engine:
                 versions.remove(new_version)
 
         tx._undo.append(undo)
+        self._record_fk_refs(tx, table_obj, values)
         tx.ops.append({"op": "update", "table": table, "pk": pk, "patch": dict(patch)})
         return dict(values)
 
@@ -638,12 +863,14 @@ class Engine:
             raise StorageError("row %r not found in table %s" % (pk, table))
         if self._conflicting_writes(versions, tx) is not None:
             raise ConflictError("row %r of %s was written after transaction %d started" % (pk, table, tx.txid))
+        self._check_fk_delete(tx, table, pk)
         version["deleted"] = tx.txid
 
         def undo():
             version["deleted"] = None
 
         tx._undo.append(undo)
+        tx._fk_dels.append((table, pk))
         tx.ops.append({"op": "delete", "table": table, "pk": pk})
         return dict(version["values"])
 
@@ -702,7 +929,8 @@ class Engine:
                 tx.commit()
                 return values
             except Exception:
-                tx.rollback()
+                if tx.state == "active":
+                    tx.rollback()
                 raise
 
     def update(self, table, pk, patch):
@@ -713,7 +941,8 @@ class Engine:
                 tx.commit()
                 return values
             except Exception:
-                tx.rollback()
+                if tx.state == "active":
+                    tx.rollback()
                 raise
 
     def delete(self, table, pk):
@@ -724,7 +953,8 @@ class Engine:
                 tx.commit()
                 return values
             except Exception:
-                tx.rollback()
+                if tx.state == "active":
+                    tx.rollback()
                 raise
 
     def transaction(self, ops, snapshot=None, isolation=None):
@@ -887,6 +1117,7 @@ class Engine:
             markers = commit_lsns(records)
             if target != int(manifest["lsn"]) and (not markers or target < markers[0]):
                 raise StorageError("no committed state at or before lsn %d in this backup" % target)
+            self._validate_restore(path, records, markers, target)
             shutil.copyfile(os.path.join(path, "data.pages"), self.pager.data_path)
             shutil.copyfile(os.path.join(path, "wal.log"), self.pager.wal_path)
             self.pager = Pager(self.root, self.page_size, auto_replay=False)
@@ -899,6 +1130,26 @@ class Engine:
                 "applied_records": applied,
                 "tables": sorted(self.tables),
             }
+
+    def _validate_restore(self, path, records, markers, target):
+        """Replay the restore target in a scratch directory and load it there.
+
+        The load runs the foreign key validation (and every other state
+        check), so a backup that would not open raises before the live
+        directory and the in-memory state are touched.
+        """
+        from .replica import _wal_prefix
+
+        reachable = [lsn for lsn in markers if lsn <= target]
+        wal_blob = _wal_prefix(records, max(reachable)) if reachable else b""
+        staging = tempfile.mkdtemp(prefix="kvse-restore-")
+        try:
+            shutil.copyfile(os.path.join(path, "data.pages"), os.path.join(staging, "data.pages"))
+            with open(os.path.join(staging, "wal.log"), "wb") as fh:
+                fh.write(wal_blob)
+            Engine(staging, page_size=self.page_size)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 class Transaction:
@@ -913,6 +1164,8 @@ class Transaction:
         self.ops = []
         self._undo = []
         self._reads = []
+        self._fk_refs = []
+        self._fk_dels = []
         self._savepoints = []
         self._suppress = 0
         self._commit_horizon = engine._commit_counter
@@ -1011,6 +1264,8 @@ class Transaction:
                 "name": name,
                 "undo": len(self._undo),
                 "ops": len(self.ops),
+                "fk_refs": len(self._fk_refs),
+                "fk_dels": len(self._fk_dels),
             })
             return True
 
@@ -1028,6 +1283,8 @@ class Transaction:
             while len(self._undo) > target["undo"]:
                 self._undo.pop()()
             del self.ops[target["ops"]:]
+            del self._fk_refs[target["fk_refs"]:]
+            del self._fk_dels[target["fk_dels"]:]
             del self._savepoints[index + 1:]
             return True
 
@@ -1069,6 +1326,17 @@ class Transaction:
                     self.state = "rolled_back"
                     engine._finish(self, False)
                     raise
+            try:
+                engine._check_foreign_keys(self)
+            except ConstraintError:
+                # A dangling reference at commit gets the same treatment as a
+                # serializable conflict: the whole transaction is undone and
+                # nothing reaches the WAL, the lsn or the audit log.
+                self._rollback_locked()
+                engine.pager.abort(self.txid)
+                self.state = "rolled_back"
+                engine._finish(self, False)
+                raise
             engine._committed.add(self.txid)
             if self.txid > engine._horizon:
                 engine._horizon = self.txid
@@ -1081,6 +1349,8 @@ class Transaction:
                 raise
             self.state = "committed"
             self._undo = []
+            self._fk_refs = []
+            self._fk_dels = []
             self._savepoints = []
             engine._finish(self, True)
             return lsn
@@ -1099,6 +1369,8 @@ class Transaction:
         while self._undo:
             self._undo.pop()()
         self.ops = []
+        self._fk_refs = []
+        self._fk_dels = []
         self._savepoints = []
 
 

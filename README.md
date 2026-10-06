@@ -210,6 +210,7 @@ every committed page.
 | primary key | must be a declared, not-null column; unique among live rows; may not be updated |
 | `unique: true` | no two live rows may share a non-null value; enforced on insert and update |
 | `nullable: false` | the column must be present and non-null |
+| `references: {"table","column"}` | foreign key to another table's primary key of the same type; a non-null value must resolve to a visible parent row on insert/update, a still-referenced parent row cannot be deleted, and both checks are repeated at commit — a violation rolls the whole transaction back |
 | type | `int` (bool rejected), `text` (str only), `bool` (bool only) |
 | unknown column | rejected on insert, update and in query predicates |
 | table/column definition | name, duplicate columns, primary key and index columns are validated at `create_table` |
