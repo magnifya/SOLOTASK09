@@ -12,9 +12,9 @@ privileges plus auditing.
 This seed already implements the storage and transaction core of that list:
 a checksummed 4096 byte page store, a redo write-ahead log with torn-tail
 tolerance, single-writer MVCC transactions with snapshot isolation,
-primary/unique/not-null/type constraints, secondary indexes, a small query
-subset, crash recovery, auditing, read-only views, snapshot backup with
-point-in-time restore, and persistent read-only replicas with consistent,
+primary/unique/not-null/type constraints, paged B+ tree secondary indexes, a
+small query subset, crash recovery, auditing, read-only views, snapshot backup
+with point-in-time restore, and persistent read-only replicas with consistent,
 lsn-pinned read sessions.
 
 ## Requirements
@@ -80,6 +80,7 @@ session = replica.read_session()  # pin reads to the current boundary
 ```
 kvse/__init__.py   public API: Engine, Transaction, StorageError
 kvse/pager.py      fixed size page file, crc32 headers, WAL append/replay/checkpoint
+kvse/btree.py      B+ tree indexes: in-memory tree + paged (de)serialization
 kvse/engine.py     catalog, MVCC rows, transactions, indexes, constraints,
                    recovery, backup/restore, audit, read-only view
 kvse/replica.py    persistent read-only replicas: directory/engine sources,
@@ -119,12 +120,42 @@ page 0            meta: {"format":"kvse-state-1","lsn","txid","audit_page",
                          "audit_pages","audit_len","state_page","state_pages",
                          "state_len","next_txid","horizon"}
 page 1..1+a-1     audit log chunks: [{"lsn","txid","at","ops":[...]}, ...]
-page 1+a..meta-1  state chunks: {"format":"kvse-db-1","tables":{name: {
-                         "columns","primary_key","indexes","rows":[[pk, values]]}}}
+page 1+a..+s-1    state chunks: {"format":"kvse-db-1","tables":{name: {
+                         "columns","primary_key","indexes","rows":[[pk, values]]}},
+                         "index_refs":[{"table","column","root","entries",
+                         "height"}, ...]}
+page 1+a+s..      B+ tree index pages, one page per node
 ```
 
 All chunks share one transaction and are written before the commit marker, so
-recovery never sees half a commit.
+recovery never sees half a commit — index pages and table pages live in the
+same WAL commit boundary.  The index references ride inside the state blob
+(which spans as many pages as it needs), so the single meta page keeps its
+size no matter how many indexes exist.
+
+### Index pages
+
+Each secondary index is persisted as a B+ tree whose nodes occupy one page
+each, serialized as JSON:
+
+```
+leaf:     {"format":"kvse-btree-1","node":"leaf","table","column",
+           "entries":[[value, pk], ...],"next":<page id|null>}
+internal: {"format":"kvse-btree-1","node":"internal","table","column",
+           "keys":[[value, pk], ...],"children":[<page id>, ...]}
+```
+
+Entries are ordered by the engine wide `sort_key` of the value and then of
+the primary key; null values carry no entry.  Leaves are linked left to right
+and internal keys are the smallest entry of their right child.  The state
+blob's `"index_refs"` lists every index with its root page, entry count and
+tree height.  Loading an image walks and validates each tree (page ids,
+checksums, connectivity, key order, match with the committed rows) and
+refuses a corrupt image with `StorageError`; `Engine.verify()` runs the same
+checks and reports `ok: false`.  Images written before paged indexes existed
+have no `"index_refs"` entry: they open unchanged and their indexes are
+rebuilt in memory from the row state, with identical query results and no
+migration.
 
 ### wal.log
 
@@ -184,7 +215,10 @@ every committed page.
   reverses the changes and drops the transaction's buffered pages.  Index
   entries of superseded versions are kept while other transactions are open
   and rebuilt from the live versions as soon as the last writer finishes, so
-  an index scan stays correct for older snapshots.
+  an index scan stays correct for older snapshots.  In memory each index is a
+  B+ tree (`kvse/btree.py`): inserts split full nodes, scans walk the leaf
+  chain in key-then-primary-key order, and every commit serializes the
+  committed entries into the index pages described above.
 * **Savepoints.** `tx.savepoint(name)` marks a named point inside an active
   transaction, `tx.rollback_to(name)` undoes every write made after it
   (inserts, updates, deletes, including primary key and unique occupancy)
@@ -328,6 +362,10 @@ python3 -m unittest discover -s tests -v
 * `tests/test_pager.py` - page write/read round trip, checksum failure,
   torn-page rejection, WAL replay after losing the page file, torn WAL tail,
   replay bounded by `max_lsn`, checkpoint.
+* `tests/test_btree.py` - in-memory B+ tree ordering, splits and range scans,
+  page serialization round trip, multi-page indexes across reopen, crash
+  recovery, checkpoint, backup/restore and replica parity, old images without
+  index pages, corrupt/broken index page rejection.
 * `tests/test_engine.py` - definition validation, constraints, commit and
   rollback, snapshot isolation, write-write conflicts, pinned snapshots,
   index maintenance, the query subset and access path choice, recovery after
@@ -346,8 +384,8 @@ python3 -m unittest discover -s tests -v
 
 ## Not implemented yet (next steps for the lane)
 
-B+ tree on-disk indexes with page splits, multi-column and covering indexes,
-joins/aggregates/ORDER BY pushdown, constraints beyond the four listed above,
+Multi-column and covering indexes, joins/aggregates/ORDER BY pushdown,
+constraints beyond the four listed above,
 triggers, multi-process concurrency with a redo/undo WAL and lock manager,
 fuzzy checkpoints and WAL archiving, inter-process replica transport
 (network/streaming fetch instead of local file copying), authentication,

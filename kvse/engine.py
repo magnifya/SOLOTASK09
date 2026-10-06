@@ -4,10 +4,15 @@ Durability model
 ----------------
 Every commit rewrites a complete, compacted image of the database into the page
 file through the WAL: chunk pages for the audit log start at page 1, chunk
-pages for the state follow, and page 0 is the meta record written last.  The
-WAL commit marker therefore makes the whole commit atomic; ``reopen`` (or a
-fresh :class:`Engine` on the same directory) replays committed WAL records and
-reproduces exactly the committed state.
+pages for the state follow, then one B+ tree page set per index (see
+``kvse.btree``), and page 0 is the meta record written last.  The WAL commit
+marker therefore makes the whole commit atomic — index pages and table pages
+share one commit boundary — and ``reopen`` (or a fresh :class:`Engine` on the
+same directory) replays committed WAL records and reproduces exactly the
+committed state.  Images written before paged indexes existed carry no index
+references in their state record; they open unchanged and their indexes are
+rebuilt from the row state in memory, so old ``data.pages``/``wal.log`` files
+need no migration.
 
 Concurrency model
 -----------------
@@ -65,9 +70,8 @@ import shutil
 import tempfile
 import threading
 import time
-from bisect import bisect_left, insort
 
-from . import query
+from . import btree, query
 from .pager import PAGE_SIZE, Pager, StorageError, commit_lsns, read_wal
 
 TYPES = ("int", "text", "bool")
@@ -242,13 +246,10 @@ class Engine:
         table_obj = self._table(table)
         if column not in table_obj["indexes"]:
             raise StorageError("no index on %s.%s" % (table, column))
-        entries = self._indexes.get((table, column), [])
-        start = 0 if low is None else bisect_left(entries, (low,))
+        tree = self._indexes.get((table, column))
         rows = []
         seen = set()
-        for value, pk in entries[start:]:
-            if high is not None and value > high:
-                break
+        for value, pk in (tree.iter_range(low, high) if tree is not None else ()):
             if pk in seen:
                 continue
             versions = table_obj["rows"].get(pk)
@@ -360,6 +361,14 @@ class Engine:
                 table["rows"][pk] = [{"created": self._horizon, "deleted": None, "values": values}]
             self.tables[name] = table
             self._rebuild_indexes(table)
+        index_refs = state.get("index_refs")
+        if index_refs is not None:
+            # A current image carries paged B+ tree indexes; they must load
+            # cleanly and match the committed row state, otherwise the image
+            # is refused instead of silently serving wrong index results.
+            # Older images have no index pages and keep the in-memory indexes
+            # rebuilt above, which yields the same query results.
+            self._check_index_pages(index_refs)
         audit_blob = self._read_pages(meta["audit_page"], meta["audit_pages"], meta["audit_len"])
         self._audit = json.loads(audit_blob.decode("utf-8")) if audit_blob else []
         self._validate_foreign_keys()
@@ -445,16 +454,128 @@ class Engine:
             }
         return {"format": DB_FORMAT, "tables": tables}
 
+    def _committed_entries(self, table, column):
+        """Sorted ``(value, pk)`` index entries of the committed row state."""
+        entries = []
+        for pk, versions in table["rows"].items():
+            version = self._visible(versions, None, self._horizon)
+            if version is None:
+                continue
+            value = version["values"].get(column)
+            if value is not None:
+                entries.append((value, pk))
+        entries.sort(key=btree.entry_key)
+        return entries
+
+    def _check_index_pages(self, refs):
+        """Validate the state blob's index page references against the rows.
+
+        Every referenced B+ tree is walked and checked structurally (page ids,
+        checksums via the pager, root to leaf connectivity, key order) and its
+        entries must reproduce exactly the committed index entries of its
+        column; every catalog index must be referenced exactly once.  Any
+        mismatch means the image cannot be trusted, so it raises
+        :class:`StorageError`.
+        """
+        if not isinstance(refs, list):
+            raise StorageError("state record holds malformed index references")
+        seen = set()
+        for ref in refs:
+            if (
+                not isinstance(ref, dict)
+                or not {"table", "column", "root"} <= set(ref)
+                or not isinstance(ref["table"], str)
+                or not isinstance(ref["column"], str)
+            ):
+                raise StorageError("state record holds a malformed index reference")
+            name, column = ref["table"], ref["column"]
+            if (name, column) in seen:
+                raise StorageError("duplicate index pages for %s.%s" % (name, column))
+            seen.add((name, column))
+            table = self.tables.get(name)
+            if table is None or column not in table["indexes"]:
+                raise StorageError("index pages reference unknown index %s.%s" % (name, column))
+            entries = btree.read_entries(
+                self.pager.read_page, ref["root"], name, column, self.pager.page_count()
+            )
+            count = ref.get("entries")
+            if count is not None and (
+                not isinstance(count, int) or isinstance(count, bool) or count != len(entries)
+            ):
+                raise StorageError(
+                    "index pages for %s.%s hold %d entries, state record says %r"
+                    % (name, column, len(entries), count)
+                )
+            want = [list(e) for e in self._committed_entries(table, column)]
+            if [list(e) for e in entries] != want:
+                raise StorageError(
+                    "index pages for %s.%s do not match the committed rows" % (name, column)
+                )
+        for name, table in self.tables.items():
+            for column in table["indexes"]:
+                if (name, column) not in seen:
+                    raise StorageError(
+                        "index %s.%s has no pages in the state record" % (name, column)
+                    )
+
+    def _index_layout(self, first_page):
+        """Serialize every index's committed entries into B+ tree pages.
+
+        Returns ``(refs, layout)``: the index references recorded in the
+        state blob and a list of ``(first_page, payloads)`` page extents.
+        """
+        refs = []
+        layout = []
+        for name in sorted(self.tables):
+            table = self.tables[name]
+            for column in sorted(table["indexes"]):
+                entries = self._committed_entries(table, column)
+                payloads, root, height = btree.build_pages(
+                    name, column, entries, first_page, self.pager.payload_size
+                )
+                refs.append({
+                    "table": name,
+                    "column": column,
+                    "root": root,
+                    "entries": len(entries),
+                    "height": height,
+                })
+                layout.append((first_page, payloads))
+                first_page += len(payloads)
+        return refs, layout
+
     def _persist(self, tx):
-        """Write audit pages, state pages and the meta page, then commit the WAL."""
+        """Write audit, state and index pages plus the meta page, then commit.
+
+        The index references live in the state blob (which spans as many
+        pages as it needs), so the single meta page keeps its baseline shape
+        and size no matter how many indexes exist.  The references name root
+        page ids, which depend on the state blob's own length, so the layout
+        is iterated to a fixed point before anything is written.
+        """
         audit_lsn = self.pager.peek_lsn()
         entry = {"lsn": audit_lsn, "txid": tx.txid, "at": self._now(), "ops": list(tx.ops)}
         audit = self._audit + [entry]
         audit_blob = json.dumps(audit, sort_keys=True, separators=(",", ":")).encode("utf-8")
         audit_pages = self._write_chunks(tx.txid, AUDIT_PAGE, audit_blob)
-        state_blob = json.dumps(self._snapshot(), sort_keys=True, separators=(",", ":")).encode("utf-8")
         state_first = AUDIT_PAGE + audit_pages
+        state = self._snapshot()
+        refs = []
+        layout = []
+        for _ in range(8):
+            state["index_refs"] = refs
+            state_blob = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            state_pages = max(1, -(-len(state_blob) // self.pager.payload_size))
+            new_refs, layout = self._index_layout(state_first + state_pages)
+            if new_refs == refs:
+                break
+            refs = new_refs
+        else:
+            raise StorageError("index page layout did not converge")
         state_pages = self._write_chunks(tx.txid, state_first, state_blob)
+        for first, payloads in layout:
+            for offset, payload in enumerate(payloads):
+                self.pager.write_page(tx.txid, first + offset, payload)
         meta_lsn = self.pager.peek_lsn()
         meta = {
             "format": STATE_FORMAT,
@@ -606,7 +727,7 @@ class Engine:
         if column in table_obj["indexes"]:
             raise StorageError("index on %s.%s already exists" % (table, column))
         table_obj["indexes"][column] = "%s_%s_idx" % (table, column)
-        self._indexes[(table, column)] = []
+        self._indexes[(table, column)] = btree.BPlusTree()
         self._rebuild_indexes(table_obj)
         tx._undo.append(lambda: self._drop_index(table, column))
         return table_obj["indexes"][column]
@@ -619,15 +740,8 @@ class Engine:
 
     def _rebuild_indexes(self, table):
         for column in table["indexes"]:
-            entries = self._indexes.setdefault((table["name"], column), [])
-            del entries[:]
-            for pk, versions in table["rows"].items():
-                version = self._visible(versions, None, self._horizon)
-                if version is None:
-                    continue
-                value = version["values"].get(column)
-                if value is not None:
-                    insort(entries, (value, pk))
+            tree = self._indexes.setdefault((table["name"], column), btree.BPlusTree())
+            tree.bulk_load(self._committed_entries(table, column))
 
     def _index_add(self, table, values):
         """Add index entries for one row version; never duplicates.
@@ -642,10 +756,8 @@ class Engine:
             value = values.get(column)
             if value is None:
                 continue
-            entries = self._indexes.setdefault((table, column), [])
-            entry = (value, pk)
-            if entry not in entries:
-                insort(entries, entry)
+            tree = self._indexes.setdefault((table, column), btree.BPlusTree())
+            tree.insert((value, pk))
 
     # ------------------------------------------------------------- row writes
     def _build_values(self, table, row, current):
@@ -1056,15 +1168,40 @@ class Engine:
                 "pages": pages,
                 "wal_records": self.pager.wal_records(),
                 "crc_ok": crc_ok,
-                "ok": bool(crc_ok and self._indexes_consistent()),
+                "ok": bool(crc_ok and self._indexes_consistent() and self._index_pages_ok()),
             }
 
+    def _index_pages_ok(self):
+        """True when the persisted B+ tree pages match the committed state.
+
+        Images written before paged indexes existed carry no index references
+        and pass trivially; anything unreadable, unconnected, unsorted or
+        disagreeing with the committed rows fails the check.
+        """
+        if self.pager.page_count() == 0:
+            return True
+        try:
+            meta = self._read_json(META_PAGE)
+            if not isinstance(meta, dict) or meta.get("format") != STATE_FORMAT:
+                return False
+            blob = self._read_pages(meta["state_page"], meta["state_pages"], meta["state_len"])
+            state = json.loads(blob.decode("utf-8"))
+            if not isinstance(state, dict):
+                return False
+            refs = state.get("index_refs")
+            if refs is None:
+                return True
+            self._check_index_pages(refs)
+            return True
+        except (StorageError, ValueError):
+            return False
+
     def _indexes_consistent(self):
-        for (table, column), entries in self._indexes.items():
+        for (table, column), tree in self._indexes.items():
             table_obj = self.tables.get(table)
             if table_obj is None:
                 return False
-            for value, pk in entries:
+            for value, pk in tree:
                 versions = table_obj["rows"].get(pk)
                 if not versions or not any(v["values"].get(column) == value for v in versions):
                     return False
@@ -1073,7 +1210,7 @@ class Engine:
                 if version is None:
                     continue
                 value = version["values"].get(column)
-                if value is not None and (value, pk) not in entries:
+                if value is not None and (value, pk) not in tree:
                     return False
         return True
 
