@@ -154,7 +154,8 @@ class Handler(BaseHTTPRequestHandler):
                 tx.insert(table, row)
             lsn = tx.commit()
         except Exception:
-            tx.rollback()
+            if tx.state == "active":
+                tx.rollback()
             raise
         return self._send(201, {"inserted": len(rows), "table": table, "lsn": lsn})
 

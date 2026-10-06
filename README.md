@@ -12,7 +12,8 @@ privileges plus auditing.
 This seed already implements the storage and transaction core of that list:
 a checksummed 4096 byte page store, a redo write-ahead log with torn-tail
 tolerance, single-writer MVCC transactions with snapshot isolation,
-primary/unique/not-null/type constraints, secondary indexes, a small query
+primary/unique/not-null/type constraints and cross-table foreign keys,
+secondary indexes, a small query
 subset, crash recovery, auditing, read-only views, snapshot backup with
 point-in-time restore, and persistent read-only replicas with consistent,
 lsn-pinned read sessions.
@@ -210,6 +211,7 @@ every committed page.
 | primary key | must be a declared, not-null column; unique among live rows; may not be updated |
 | `unique: true` | no two live rows may share a non-null value; enforced on insert and update |
 | `nullable: false` | the column must be present and non-null |
+| `references` | foreign key to another table's primary key; see below |
 | type | `int` (bool rejected), `text` (str only), `bool` (bool only) |
 | unknown column | rejected on insert, update and in query predicates |
 | table/column definition | name, duplicate columns, primary key and index columns are validated at `create_table` |
@@ -217,6 +219,32 @@ every committed page.
 
 Violations raise `ConstraintError`, conflicts raise `ConflictError`; both are
 subclasses of `StorageError`.
+
+### Foreign keys
+
+A column may declare `references: {"table": "accounts", "column": "id"}` —
+both in `Engine.create_table` and in `POST /v1/tables`.  The target must be
+the primary key of an already existing table with the same column type; a
+malformed object, an unknown table or column, a non primary key target or a
+type mismatch raises `StorageError` at definition time.  The definition is
+persisted in the catalog and reported verbatim by `table_info` and the create
+response; columns without `references` (including every database written by
+an older version) simply have no foreign key.
+
+A null value never triggers a lookup.  Referential integrity is judged at
+commit time against what the committing transaction can see — its snapshot
+plus its own earlier writes — so parent and child rows may be inserted or
+deleted in any order inside one transaction as long as the final state is
+fully linked.  A commit that would leave any dangling reference (a dangling
+insert or update, deleting a still-referenced parent, or a batch whose net
+effect dangles) raises `ConstraintError` and rolls the whole transaction
+back: rows, indexes, savepoint effects, WAL pages, the commit marker, the lsn
+and the audit log show no partial result.  `Engine.insert`/`update`/`delete`,
+`Transaction` batches, savepoint rollbacks and `POST /v1/tx` all share this
+one judgment; HTTP answers it with `409` and the usual `{"error": "..."}`
+body.  Loading a state image (reopen, crash recovery, backup restore at any
+lsn, replica sync) revalidates definitions and data and rejects a broken
+image with `StorageError` without replacing the previously usable state.
 
 ## HTTP API
 
@@ -342,11 +370,15 @@ python3 -m unittest discover -s tests -v
 * `tests/test_savepoints.py` - named savepoints: partial rollback of row and
   index writes, name validation and invalidation, release semantics, lsn and
   audit neutrality, serializable predicate survival, batch and HTTP ops.
+* `tests/test_foreign_keys.py` - reference definitions and their validation,
+  commit-time enforcement with full rollback, savepoint and serializable
+  interplay, HTTP 409s, reopen/recovery/backup/restore/replica preservation
+  and rejection of dangling state images.
 
 ## Not implemented yet (next steps for the lane)
 
 B+ tree on-disk indexes with page splits, multi-column and covering indexes,
-joins/aggregates/ORDER BY pushdown, constraints beyond the four listed above,
+joins/aggregates/ORDER BY pushdown, constraints beyond those listed above,
 triggers, multi-process concurrency with a redo/undo WAL and lock manager,
 fuzzy checkpoints and WAL archiving, inter-process replica transport
 (network/streaming fetch instead of local file copying), authentication,
