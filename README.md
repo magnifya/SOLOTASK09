@@ -45,8 +45,8 @@ python3 -m kvse --data-dir ./kvse_data verify
 python3 -m kvse --data-dir ./kvse_data tx-demo
 ```
 
-`table.json` is `{"name", "columns", "primary_key", "indexes"}`; `rows.json` is
-a row object or an array of row objects.
+`table.json` is `{"name", "columns", "primary_key", "indexes", "checks"?}`;
+`rows.json` is a row object or an array of row objects.
 
 ```python
 from kvse import Engine, Replica, StorageError
@@ -245,6 +245,7 @@ every committed page.
 | `unique: true` | no two live rows may share a non-null value; enforced on insert and update |
 | `nullable: false` | the column must be present and non-null |
 | `references: {"table","column"}` | foreign key to another table's primary key of the same type; a non-null value must resolve to a visible parent row on insert/update, a still-referenced parent row cannot be deleted, and both checks are repeated at commit — a violation rolls the whole transaction back |
+| `checks: [{"name","predicates"}]` | row-level CHECK constraints; each predicate is a `where`-style `[column, op, value]` over the table's own columns with `=`/`!=`/`<`/`<=`/`>`/`>=`, ANDed per check; evaluated on the complete row at insert/update and again at commit — a violation rolls the whole transaction back |
 | type | `int` (bool rejected), `text` (str only), `bool` (bool only) |
 | unknown column | rejected on insert, update and in query predicates |
 | table/column definition | name, duplicate columns, primary key and index columns are validated at `create_table` |
@@ -262,7 +263,7 @@ subclasses of `StorageError`.
 | Method | Path | Body / query | Success | Errors |
 | --- | --- | --- | --- | --- |
 | GET | `/healthz` | - | 200 `{"ok": true}` | - |
-| POST | `/v1/tables` | `{"name","columns","primary_key","indexes"?}` | 201 table info | 400 |
+| POST | `/v1/tables` | `{"name","columns","primary_key","indexes"?,"checks"?}` | 201 table info | 400 |
 | GET | `/v1/tables` | - | 200 `{"tables":[...]}` | - |
 | POST | `/v1/tables/{table}/rows` | `{"rows":[...]}` | 201 `{"inserted":n,"lsn":n}` | 400, 404, 409 |
 | GET | `/v1/tables/{table}/rows/{pk}` | - | 200 row | 404 |

@@ -58,6 +58,33 @@ movement or audit record survive.  Loaded state (reopen, recovery, restore,
 replica sync) is validated the same way and rejected with
 :class:`StorageError` when a definition or a dangling row does not check
 out.
+
+CHECK constraints
+-----------------
+A table definition may carry a ``checks`` array; each entry has a non-empty
+name unique within the table and at least one predicate in the ``where``
+form (``[column, op, value]`` or ``{"column", "op", "value"}``).  Predicates
+may only reference the table's own columns, the operator must be one of
+``=``, ``!=``, ``<``, ``<=``, ``>``, ``>=`` and a non-null constant must
+match the column type; the predicates of one check are ANDed.  ``=`` and
+``!=`` compare directly (null included), every other operator is true only
+when both sides are non-null.  A missing ``checks`` key means no constraint,
+so definitions written before checks existed keep working unchanged.
+
+Once an insert or update has produced the complete row, every check is
+evaluated before anything is persisted; a violation raises
+:class:`ConstraintError` naming the table and the constraint and the
+transaction stays usable.  The rows a transaction inserted or updated are
+verified again at commit; a failure there rolls the whole transaction back
+and terminates it — no writes, lsn movement, WAL commit marker or audit
+record survive.  Rolling back to a savepoint cannot skip the checks: the
+per-operation evaluation already ran before any side effect, and the
+commit-time list of rows to re-verify is truncated together with the undo
+log.  The definitions live in the state snapshot and are re-validated —
+together with every visible row — on reopen, WAL recovery, restore and
+replica sync; a corrupt definition or a violating row is refused with
+:class:`StorageError`.  Images written before checks existed carry no
+``checks`` key and open without migration.
 """
 
 from __future__ import annotations
@@ -152,8 +179,16 @@ class Engine:
                 "columns": [self._column_info(col) for col in table["columns"]],
                 "primary_key": table["primary_key"],
                 "indexes": dict(table["indexes"]),
+                "checks": self._checks_info(table),
                 "rows": len(table["rows"]),
             }
+
+    @staticmethod
+    def _checks_info(table):
+        return [
+            {"name": check["name"], "predicates": [list(p) for p in check["predicates"]]}
+            for check in table["checks"]
+        ]
 
     @staticmethod
     def _column_info(column):
@@ -355,6 +390,7 @@ class Engine:
                 "columns": info["columns"],
                 "primary_key": info["primary_key"],
                 "indexes": {col: "%s_%s_idx" % (name, col) for col in info.get("indexes", [])},
+                "checks": info.get("checks") or [],
                 "rows": {},
             }
             for pk, values in info["rows"]:
@@ -372,6 +408,33 @@ class Engine:
         audit_blob = self._read_pages(meta["audit_page"], meta["audit_pages"], meta["audit_len"])
         self._audit = json.loads(audit_blob.decode("utf-8")) if audit_blob else []
         self._validate_foreign_keys()
+        self._validate_checks()
+
+    def _validate_checks(self):
+        """Reject loaded state whose CHECK definitions or rows do not hold.
+
+        Every check definition must be well formed against the table's
+        columns (the definitions are normalized in place, so older or
+        hand-written images are handled the same as freshly written ones),
+        and every visible row must satisfy every check of its table.
+        Anything else means the state on disk is not one this engine could
+        have committed, so it is refused with :class:`StorageError`.
+        """
+        for name, table in self.tables.items():
+            table["checks"] = self._normalize_checks(name, table["columns"], table["checks"])
+        for name, table in self.tables.items():
+            if not table["checks"]:
+                continue
+            for pk, versions in table["rows"].items():
+                version = self._visible(versions, None, self._horizon)
+                if version is None:
+                    continue
+                for check in table["checks"]:
+                    if not self._check_holds(check, version["values"]):
+                        raise StorageError(
+                            "table %s row %r violates check constraint %s"
+                            % (name, pk, check["name"])
+                        )
 
     def _validate_foreign_keys(self):
         """Reject loaded state whose foreign keys do not hold.
@@ -450,6 +513,7 @@ class Engine:
                 "columns": table["columns"],
                 "primary_key": table["primary_key"],
                 "indexes": sorted(table["indexes"]),
+                "checks": self._checks_info(table),
                 "rows": rows,
             }
         return {"format": DB_FORMAT, "tables": tables}
@@ -597,7 +661,7 @@ class Engine:
         return lsn
 
     # ------------------------------------------------------------- definition
-    def _check_definition(self, name, columns, primary_key, indexes):
+    def _check_definition(self, name, columns, primary_key, indexes, checks=None):
         if not isinstance(name, str) or not name.strip():
             raise StorageError("table name must be a non-empty string")
         if not isinstance(columns, list) or not columns:
@@ -628,6 +692,84 @@ class Engine:
         for column in indexes:
             if column not in seen:
                 raise StorageError("index column %r is not a column of table %s" % (column, name))
+        return self._normalize_checks(name, columns, checks)
+
+    @staticmethod
+    def _normalize_checks(table, columns, checks):
+        """Validate a ``checks`` array and return its normalized form.
+
+        The result is a list of ``{"name": str, "predicates": [[column, op,
+        value], ...]}`` ready to be persisted in the catalog.  ``None``
+        means "no checks" and normalizes to an empty list, so definitions
+        written before checks existed stay valid.
+        """
+        if checks is None:
+            return []
+        if not isinstance(checks, (list, tuple)):
+            raise StorageError("checks of table %s must be a list" % table)
+        by_name = {column["name"]: column for column in columns}
+        normalized = []
+        seen = set()
+        for check in checks:
+            if not isinstance(check, dict):
+                raise StorageError("check definitions on table %s must be objects" % table)
+            cname = check.get("name")
+            if not isinstance(cname, str) or not cname.strip():
+                raise StorageError("check name on table %s must be a non-empty string" % table)
+            if cname in seen:
+                raise StorageError("duplicate check %s on table %s" % (cname, table))
+            seen.add(cname)
+            predicates = check.get("predicates")
+            if not isinstance(predicates, (list, tuple)) or not predicates:
+                raise StorageError(
+                    "check %s on table %s needs at least one predicate" % (cname, table)
+                )
+            conds = []
+            for item in predicates:
+                if isinstance(item, (list, tuple)) and len(item) == 3:
+                    column, op, value = item
+                elif isinstance(item, dict):
+                    column = item.get("column", item.get("col"))
+                    op = item.get("op", "=")
+                    value = item.get("value")
+                else:
+                    raise StorageError(
+                        "each predicate of check %s on table %s must be "
+                        "[column, op, value]" % (cname, table)
+                    )
+                if op not in query.OPS:
+                    raise StorageError(
+                        "check %s on table %s uses unsupported operator %r" % (cname, table, op)
+                    )
+                if column not in by_name:
+                    raise StorageError(
+                        "check %s on table %s references unknown column %s.%s"
+                        % (cname, table, table, column)
+                    )
+                if value is not None and not query.check_type(value, by_name[column]["type"]):
+                    raise StorageError(
+                        "predicate of check %s on %s.%s expects %s"
+                        % (cname, table, column, by_name[column]["type"])
+                    )
+                conds.append([column, op, value])
+            normalized.append({"name": cname, "predicates": conds})
+        return normalized
+
+    @staticmethod
+    def _check_holds(check, values):
+        """True when a complete row satisfies every predicate of ``check``."""
+        return all(
+            query.compare(op, values.get(column), value)
+            for column, op, value in check["predicates"]
+        )
+
+    def _evaluate_checks(self, table, values):
+        """Enforce every CHECK constraint of ``table`` on a complete row."""
+        for check in table["checks"]:
+            if not self._check_holds(check, values):
+                raise ConstraintError(
+                    "check constraint %s violated on table %s" % (check["name"], table["name"])
+                )
 
     def _check_reference(self, table, column, ref):
         """Validate one ``references`` object against the existing catalog."""
@@ -660,9 +802,9 @@ class Engine:
                 % (cname, table, column["type"], target_name, target_column, pk_column["type"])
             )
 
-    def create_table(self, name, columns, primary_key, indexes=None):
+    def create_table(self, name, columns, primary_key, indexes=None, checks=None):
         with self._lock:
-            self._check_definition(name, columns, primary_key, indexes)
+            checks = self._check_definition(name, columns, primary_key, indexes, checks)
             if name in self.tables:
                 raise StorageError("table %s already exists" % name)
             tx = self._begin()
@@ -686,6 +828,7 @@ class Engine:
                     "columns": catalog,
                     "primary_key": primary_key,
                     "indexes": {},
+                    "checks": checks,
                     "rows": {},
                 }
                 tx._undo.append(lambda: self._drop_table(name))
@@ -696,6 +839,7 @@ class Engine:
                     "table": name,
                     "primary_key": primary_key,
                     "indexes": sorted(indexes or []),
+                    "checks": checks,
                 })
                 tx.commit()
             except Exception:
@@ -904,6 +1048,20 @@ class Engine:
                             "referenced by %s.%s" % (pk, parent_name, child_name, column_name)
                         )
 
+    def _check_commit_checks(self, tx):
+        """Re-validate the rows a committing transaction inserted or updated.
+
+        The per-operation CHECK evaluation ran when each row was written;
+        repeating it against the newest catalog right before the commit
+        becomes durable guarantees no checked row can slip through, whatever
+        happened between the write and the commit.
+        """
+        for table_name, values in tx._check_rows:
+            table = self.tables.get(table_name)
+            if table is None:
+                continue
+            self._evaluate_checks(table, values)
+
     def _insert(self, tx, table, row):
         table_obj = self._table(table)
         values = self._build_values(table_obj, row, None)
@@ -915,6 +1073,7 @@ class Engine:
             raise ConflictError("primary key %r in table %s is written by another transaction" % (pk, table))
         self._check_unique(tx, table_obj, values, None)
         self._check_fk_values(tx, table_obj, values)
+        self._evaluate_checks(table_obj, values)
         version = {"created": tx.txid, "deleted": None, "values": values}
         table_obj["rows"].setdefault(pk, []).append(version)
         self._index_add(table, values)
@@ -928,6 +1087,7 @@ class Engine:
 
         tx._undo.append(undo)
         self._record_fk_refs(tx, table_obj, values)
+        tx._check_rows.append((table, values))
         tx.ops.append({"op": "insert", "table": table, "pk": pk, "row": values})
         return dict(values)
 
@@ -949,6 +1109,7 @@ class Engine:
             raise ConstraintError("primary key of %s may not be updated" % table)
         self._check_unique(tx, table_obj, values, pk)
         self._check_fk_values(tx, table_obj, values)
+        self._evaluate_checks(table_obj, values)
         version["deleted"] = tx.txid
         new_version = {"created": tx.txid, "deleted": None, "values": values}
         versions.append(new_version)
@@ -961,6 +1122,7 @@ class Engine:
 
         tx._undo.append(undo)
         self._record_fk_refs(tx, table_obj, values)
+        tx._check_rows.append((table, values))
         tx.ops.append({"op": "update", "table": table, "pk": pk, "patch": dict(patch)})
         return dict(values)
 
@@ -1303,6 +1465,7 @@ class Transaction:
         self._reads = []
         self._fk_refs = []
         self._fk_dels = []
+        self._check_rows = []
         self._savepoints = []
         self._suppress = 0
         self._commit_horizon = engine._commit_counter
@@ -1403,6 +1566,7 @@ class Transaction:
                 "ops": len(self.ops),
                 "fk_refs": len(self._fk_refs),
                 "fk_dels": len(self._fk_dels),
+                "check_rows": len(self._check_rows),
             })
             return True
 
@@ -1422,6 +1586,7 @@ class Transaction:
             del self.ops[target["ops"]:]
             del self._fk_refs[target["fk_refs"]:]
             del self._fk_dels[target["fk_dels"]:]
+            del self._check_rows[target["check_rows"]:]
             del self._savepoints[index + 1:]
             return True
 
@@ -1465,10 +1630,12 @@ class Transaction:
                     raise
             try:
                 engine._check_foreign_keys(self)
+                engine._check_commit_checks(self)
             except ConstraintError:
-                # A dangling reference at commit gets the same treatment as a
-                # serializable conflict: the whole transaction is undone and
-                # nothing reaches the WAL, the lsn or the audit log.
+                # A dangling reference or a CHECK violation at commit gets
+                # the same treatment as a serializable conflict: the whole
+                # transaction is undone and nothing reaches the WAL, the lsn
+                # or the audit log.
                 self._rollback_locked()
                 engine.pager.abort(self.txid)
                 self.state = "rolled_back"
@@ -1488,6 +1655,7 @@ class Transaction:
             self._undo = []
             self._fk_refs = []
             self._fk_dels = []
+            self._check_rows = []
             self._savepoints = []
             engine._finish(self, True)
             return lsn
@@ -1508,6 +1676,7 @@ class Transaction:
         self.ops = []
         self._fk_refs = []
         self._fk_dels = []
+        self._check_rows = []
         self._savepoints = []
 
 

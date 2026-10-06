@@ -138,7 +138,8 @@ class Handler(BaseHTTPRequestHandler):
     def _create_table(self, body):
         name = body.get("name")
         info = self.engine.create_table(
-            name, body.get("columns") or [], body.get("primary_key"), body.get("indexes") or []
+            name, body.get("columns") or [], body.get("primary_key"), body.get("indexes") or [],
+            checks=body.get("checks"),
         )
         return self._send(201, dict(info, index_names=sorted(info["indexes"])))
 

@@ -125,7 +125,8 @@ def cmd_create_table(args):
     engine = Engine(args.data_dir)
     data = load_json(args.file)
     info = engine.create_table(
-        data.get("name"), data.get("columns") or [], data.get("primary_key"), data.get("indexes") or []
+        data.get("name"), data.get("columns") or [], data.get("primary_key"), data.get("indexes") or [],
+        checks=data.get("checks"),
     )
     emit({"created": info["name"], "primary_key": info["primary_key"],
           "indexes": sorted(info["indexes"]), "columns": [c["name"] for c in info["columns"]]})
