@@ -12,10 +12,10 @@ privileges plus auditing.
 This seed already implements the storage and transaction core of that list:
 a checksummed 4096 byte page store, a redo write-ahead log with torn-tail
 tolerance, single-writer MVCC transactions with snapshot isolation,
-primary/unique/not-null/type constraints, secondary indexes, a small query
-subset, crash recovery, auditing, read-only views, snapshot backup with
-point-in-time restore, and persistent read-only replicas with consistent,
-lsn-pinned read sessions.
+primary/unique/not-null/type constraints, secondary indexes persisted as
+paged B+ trees, a small query subset, crash recovery, auditing, read-only
+views, snapshot backup with point-in-time restore, and persistent read-only
+replicas with consistent, lsn-pinned read sessions.
 
 ## Requirements
 
@@ -119,12 +119,34 @@ page 0            meta: {"format":"kvse-state-1","lsn","txid","audit_page",
                          "audit_pages","audit_len","state_page","state_pages",
                          "state_len","next_txid","horizon"}
 page 1..1+a-1     audit log chunks: [{"lsn","txid","at","ops":[...]}, ...]
-page 1+a..meta-1  state chunks: {"format":"kvse-db-1","tables":{name: {
-                         "columns","primary_key","indexes","rows":[[pk, values]]}}}
+page 1+a..1+a+b-1 index section (only when some table declares an index):
+                  B+ tree pages followed by the index directory chunks
+page 1+a+b..      state chunks: {"format":"kvse-db-1","tables":{name: {
+                         "columns","primary_key","indexes","rows":[[pk, values]]}},
+                         "index_section": {"tree_first","tree_count",
+                         "dir_page","dir_pages","dir_len"}?}
 ```
 
 All chunks share one transaction and are written before the commit marker, so
-recovery never sees half a commit.
+recovery never sees half a commit - table pages and index pages are atomic
+together.  Images written before indexes were persisted carry no
+`index_section` and open unchanged: their indexes are rebuilt from the row
+versions exactly as before, and the next commit starts writing index pages.
+
+### B+ tree index pages
+
+Each secondary index is stored as a B+ tree of fixed size pages, bulk-loaded
+from the committed entries at every commit.  A leaf page holds sorted
+`[[key, value, pk], ...]` entries plus a `next` page id; an internal page
+holds separator `keys` plus `children` page ids, one more child than keys.
+`key` is `[sort_key(value), sort_key(pk)]`, so scans are ordered by value and
+then by primary key; null values are never indexed.  A page that would
+overflow splits into a fresh one, and the directory chunk lists every index
+with its root page.  Loading and `verify` check page numbers, checksums,
+root-to-leaf connectivity, key order and primary key references, and compare
+the trees against the committed rows; a corrupt, missing or mis-sorted page
+makes `verify` report `ok: false` and makes opening the directory raise
+`StorageError`.
 
 ### wal.log
 
@@ -184,7 +206,11 @@ every committed page.
   reverses the changes and drops the transaction's buffered pages.  Index
   entries of superseded versions are kept while other transactions are open
   and rebuilt from the live versions as soon as the last writer finishes, so
-  an index scan stays correct for older snapshots.
+  an index scan stays correct for older snapshots.  The persisted B+ tree
+  pages always hold exactly the committed entries: they are written inside
+  the same WAL transaction as the table pages, add no audit operations and
+  no extra commit boundaries, and are validated against the committed rows
+  on every load.
 * **Savepoints.** `tx.savepoint(name)` marks a named point inside an active
   transaction, `tx.rollback_to(name)` undoes every write made after it
   (inserts, updates, deletes, including primary key and unique occupancy)
@@ -343,12 +369,17 @@ python3 -m unittest discover -s tests -v
 * `tests/test_savepoints.py` - named savepoints: partial rollback of row and
   index writes, name validation and invalidation, release semantics, lsn and
   audit neutrality, serializable predicate survival, batch and HTTP ops.
+* `tests/test_btree.py` - persisted B+ tree indexes: page splits and deep
+  trees, key order and bounds, restart/checkpoint/backup/restore/replica
+  parity, legacy images without index pages, lsn/audit neutrality, and
+  corruption (checksum, ordering, pointers, missing pages, wrong references)
+  surfacing as `verify()["ok"] == False` and `StorageError` on reopen.
 
 ## Not implemented yet (next steps for the lane)
 
-B+ tree on-disk indexes with page splits, multi-column and covering indexes,
-joins/aggregates/ORDER BY pushdown, constraints beyond the four listed above,
-triggers, multi-process concurrency with a redo/undo WAL and lock manager,
-fuzzy checkpoints and WAL archiving, inter-process replica transport
-(network/streaming fetch instead of local file copying), authentication,
-privileges and audit retention policies.
+Multi-column and covering indexes, joins/aggregates/ORDER BY pushdown,
+constraints beyond the four listed above, triggers, multi-process
+concurrency with a redo/undo WAL and lock manager, fuzzy checkpoints and
+WAL archiving, inter-process replica transport (network/streaming fetch
+instead of local file copying), authentication, privileges and audit
+retention policies.

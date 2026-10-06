@@ -37,6 +37,27 @@ survive a partial rollback.  Savepoints are purely in-memory: they never
 touch the WAL, the lsn or the audit log, and nothing about them survives
 commit, rollback, restart or restore.
 
+Index pages
+-----------
+Every secondary index is also persisted as a B+ tree of fixed size pages.
+Each commit bulk-loads the committed entries of every index into leaf pages
+(sorted by ``sort_key`` of the value, then of the primary key, with nulls
+omitted), links the leaves left to right and packs separator levels above
+them until a single root remains; a page that would overflow splits into a
+fresh one.  The tree pages and their directory are written through the WAL
+inside the same transaction as the audit, state and meta pages, so the
+commit marker makes table and index pages atomic together and crash
+recovery can never expose half of either.  The state blob carries an
+``index_section`` descriptor locating the tree pages and the directory;
+images written before indexes were persisted have no such descriptor and
+simply rebuild their indexes from the row versions, exactly as before.
+Loading validates the persisted trees (page numbers, checksums, root-to-leaf
+connectivity, key order and primary key references, plus an exact comparison
+against the committed rows) and refuses the image with :class:`StorageError`
+when anything is off; ``verify`` runs the same checks and reports them in
+its ``ok`` field.  Index maintenance adds no audit operations and no extra
+commit boundaries: the tree pages ride along in the table's own commit.
+
 Foreign keys
 ------------
 A column may carry a ``references`` object ``{"table": T, "column": C}``
@@ -76,6 +97,25 @@ AUDIT_PAGE = 1
 STATE_FORMAT = "kvse-state-1"
 DB_FORMAT = "kvse-db-1"
 BACKUP_FORMAT = "kvse-backup-1"
+INDEX_FORMAT = "kvse-index-1"
+BTREE_FORMAT = "kvse-btree-1"
+BTREE_MAX_DEPTH = 64
+# Placeholder for a leaf's "next" pointer while a page is being sized; ten
+# digits reserve enough room for any realistic page id.
+_NEXT_PAD = 4294967295
+
+
+def _entry_key(value, pk):
+    """JSON-safe sort key for one index entry: ``sort_key`` of value, then pk."""
+    return [list(query.sort_key(value)), list(query.sort_key(pk))]
+
+
+def _key_less(left, right):
+    """Strict ``left < right`` on decoded btree keys; corrupt keys are errors."""
+    try:
+        return left < right
+    except TypeError:
+        raise StorageError("btree keys %r and %r are not comparable" % (left, right))
 
 
 class ConflictError(StorageError):
@@ -363,6 +403,11 @@ class Engine:
         audit_blob = self._read_pages(meta["audit_page"], meta["audit_pages"], meta["audit_len"])
         self._audit = json.loads(audit_blob.decode("utf-8")) if audit_blob else []
         self._validate_foreign_keys()
+        # Persisted B+ tree indexes ride along with the state image; they are
+        # validated against the committed rows before being trusted.  A legacy
+        # image carries no index section and keeps the rebuilt indexes above.
+        for tag, entries in self._check_index_section(meta, state.get("index_section")).items():
+            self._indexes[tag] = entries
 
     def _validate_foreign_keys(self):
         """Reject loaded state whose foreign keys do not hold.
@@ -446,14 +491,30 @@ class Engine:
         return {"format": DB_FORMAT, "tables": tables}
 
     def _persist(self, tx):
-        """Write audit pages, state pages and the meta page, then commit the WAL."""
+        """Write audit, index, state and meta pages, then commit the WAL.
+
+        The B+ tree index pages are part of the same WAL transaction as the
+        audit, state and meta pages, so the commit marker below covers all of
+        them and recovery can never expose a table image without the index
+        pages that belong to it.
+        """
         audit_lsn = self.pager.peek_lsn()
         entry = {"lsn": audit_lsn, "txid": tx.txid, "at": self._now(), "ops": list(tx.ops)}
         audit = self._audit + [entry]
         audit_blob = json.dumps(audit, sort_keys=True, separators=(",", ":")).encode("utf-8")
         audit_pages = self._write_chunks(tx.txid, AUDIT_PAGE, audit_blob)
-        state_blob = json.dumps(self._snapshot(), sort_keys=True, separators=(",", ":")).encode("utf-8")
-        state_first = AUDIT_PAGE + audit_pages
+        section = self._build_index_section(AUDIT_PAGE + audit_pages)
+        state = self._snapshot()
+        index_pages = 0
+        if section is not None:
+            tree_pages, dir_blob, info = section
+            for page_id in sorted(tree_pages):
+                self.pager.write_page(tx.txid, page_id, self._btree_dumps(tree_pages[page_id]))
+            info["dir_pages"] = self._write_chunks(tx.txid, info["dir_page"], dir_blob)
+            state["index_section"] = info
+            index_pages = info["tree_count"] + info["dir_pages"]
+        state_blob = json.dumps(state, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        state_first = AUDIT_PAGE + audit_pages + index_pages
         state_pages = self._write_chunks(tx.txid, state_first, state_blob)
         meta_lsn = self.pager.peek_lsn()
         meta = {
@@ -646,6 +707,346 @@ class Engine:
             entry = (value, pk)
             if entry not in entries:
                 insort(entries, entry)
+
+    # ------------------------------------------- persisted B+ tree indexes
+    def _btree_dumps(self, node):
+        return json.dumps(node, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def _committed_index_entries(self, table, column):
+        """Sorted ``(value, pk)`` pairs the committed state puts into one index.
+
+        Null values are never indexed; ordering follows ``sort_key`` of the
+        value first and of the primary key second, which keeps scans stable.
+        """
+        entries = []
+        for pk, versions in self.tables[table]["rows"].items():
+            version = self._visible(versions, None, self._horizon)
+            if version is None:
+                continue
+            value = version["values"].get(column)
+            if value is not None:
+                entries.append((value, pk))
+        entries.sort(key=lambda item: (query.sort_key(item[0]), query.sort_key(item[1])))
+        return entries
+
+    def _pack_nodes(self, items, make, measure):
+        """Greedy-pack items into node groups that each fit in one page.
+
+        ``make(group)`` renders the node dict (used for the fixed overhead)
+        and ``measure(item)`` is a pessimistic serialized size of one item,
+        so every emitted group is guaranteed to fit before it is rendered
+        for real.  Overflowing a full page starts a fresh one - the page
+        split of the bulk load.
+        """
+        if not items:
+            return [[]]
+        limit = self.pager.payload_size
+        overhead = len(self._btree_dumps(make([])))
+        groups = []
+        current = []
+        current_size = overhead
+        for item in items:
+            size = measure(item)
+            if overhead + size > limit:
+                raise StorageError("a single index entry exceeds one page")
+            if current and current_size + size > limit:
+                groups.append(current)
+                current = []
+                current_size = overhead
+            current.append(item)
+            current_size += size
+        if current:
+            groups.append(current)
+        return groups
+
+    def _build_btree(self, tag, entries, first_page):
+        """Bulk-load sorted entries into a page B+ tree.
+
+        Returns ``(pages, root_page, next_page)`` with ``pages`` mapping page
+        id to its node dict.  Leaves are filled to capacity in key order and
+        linked left to right; internal levels above them are packed the same
+        way, so every page stays reachable from the root even when deletes
+        left the previous generation of pages sparse.
+        """
+        tag_list = [tag[0], tag[1]]
+        encoded = [[_entry_key(value, pk), value, pk] for value, pk in entries]
+
+        def leaf_make(group):
+            return {
+                "format": BTREE_FORMAT, "kind": "leaf", "index": tag_list,
+                "entries": group, "next": _NEXT_PAD,
+            }
+
+        groups = self._pack_nodes(
+            encoded, leaf_make, lambda item: len(self._btree_dumps(item)) + 1
+        )
+        pages = {}
+        level = []
+        page_id = first_page
+        for position, group in enumerate(groups):
+            node = leaf_make(group)
+            node["next"] = page_id + 1 if position + 1 < len(groups) else None
+            pages[page_id] = node
+            level.append((page_id, group[0][0] if group else None))
+            page_id += 1
+        while len(level) > 1:
+            def internal_make(group):
+                return {
+                    "format": BTREE_FORMAT, "kind": "internal", "index": tag_list,
+                    "keys": [key for _pid, key in group[1:]],
+                    "children": [pid for pid, _key in group],
+                }
+
+            groups = self._pack_nodes(
+                level, internal_make,
+                lambda item: len(self._btree_dumps(item[0])) + len(self._btree_dumps(item[1])) + 2,
+            )
+            if len(groups) > 1 and len(groups[-1]) == 1 and len(groups[-2]) > 2:
+                groups[-1].insert(0, groups[-2].pop())
+            upper = []
+            for group in groups:
+                pages[page_id] = internal_make(group)
+                upper.append((page_id, group[0][1]))
+                page_id += 1
+            level = upper
+        for node in pages.values():
+            if len(self._btree_dumps(node)) > self.pager.payload_size:
+                raise StorageError(
+                    "index page for %s.%s does not fit in %d bytes"
+                    % (tag[0], tag[1], self.pager.payload_size)
+                )
+        return pages, level[0][0], page_id
+
+    def _build_index_section(self, first_page):
+        """Serialize every catalog index as a B+ tree plus a directory.
+
+        Returns ``(tree_pages, directory_blob, info)`` where ``info`` is the
+        ``index_section`` descriptor stored inside the state blob, or ``None``
+        when no table declares an index (the legacy layout is then kept
+        byte-for-byte).
+        """
+        tags = [
+            (name, column)
+            for name in sorted(self.tables)
+            for column in sorted(self.tables[name]["indexes"])
+        ]
+        if not tags:
+            return None
+        tree_pages = {}
+        listing = []
+        page_id = first_page
+        for tag in tags:
+            entries = self._committed_index_entries(*tag)
+            nodes, root, page_id = self._build_btree(tag, entries, page_id)
+            tree_pages.update(nodes)
+            listing.append({
+                "table": tag[0],
+                "column": tag[1],
+                "root": root,
+                "pages": len(nodes),
+                "entries": len(entries),
+            })
+        dir_blob = json.dumps(
+            {"format": INDEX_FORMAT, "indexes": listing},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        info = {
+            "tree_first": first_page,
+            "tree_count": len(tree_pages),
+            "dir_page": page_id,
+            "dir_len": len(dir_blob),
+        }
+        return tree_pages, dir_blob, info
+
+    def _check_btree_entry(self, item, tag):
+        """Validate one decoded leaf entry and return its key."""
+        if not isinstance(item, list) or len(item) != 3:
+            raise StorageError("btree entry of %s.%s is malformed" % tag)
+        key, value, pk = item
+        if key != _entry_key(value, pk):
+            raise StorageError("btree entry of %s.%s carries a wrong sort key" % tag)
+        return key
+
+    def _read_btree(self, root, tag):
+        """Validate one persisted B+ tree; return ``(entries, page_ids)``.
+
+        The walk checks page kinds, key ordering, separator consistency and
+        the leaf chain from the root down, so a corrupt, disconnected or
+        mis-sorted tree is rejected instead of being served.
+        """
+        if not isinstance(root, int) or isinstance(root, bool) or root < 1:
+            raise StorageError("btree for %s.%s has an invalid root page %r" % (tag + (root,)))
+        visited = set()
+        leaves = []
+        entries = []
+
+        def walk(page_id, depth):
+            if depth > BTREE_MAX_DEPTH:
+                raise StorageError(
+                    "btree for %s.%s is deeper than %d levels" % (tag + (BTREE_MAX_DEPTH,))
+                )
+            if not isinstance(page_id, int) or isinstance(page_id, bool) or page_id < 1:
+                raise StorageError("btree for %s.%s has an invalid page pointer %r" % (tag + (page_id,)))
+            if page_id in visited:
+                raise StorageError("btree page %d is referenced more than once" % page_id)
+            visited.add(page_id)
+            node = self._read_json(page_id)
+            if not isinstance(node, dict) or node.get("format") != BTREE_FORMAT:
+                raise StorageError("page %d is not a %s node" % (page_id, BTREE_FORMAT))
+            if node.get("index") != [tag[0], tag[1]]:
+                raise StorageError("btree page %d belongs to another index" % page_id)
+            kind = node.get("kind")
+            if kind == "leaf":
+                items = node.get("entries")
+                if not isinstance(items, list):
+                    raise StorageError("btree leaf %d is malformed" % page_id)
+                previous = None
+                for item in items:
+                    key = self._check_btree_entry(item, tag)
+                    if previous is not None and not _key_less(previous, key):
+                        raise StorageError("btree leaf %d is not sorted" % page_id)
+                    previous = key
+                leaves.append((page_id, node.get("next")))
+                entries.extend(items)
+                return (items[0][0], items[-1][0]) if items else (None, None)
+            if kind == "internal":
+                keys = node.get("keys")
+                children = node.get("children")
+                if (
+                    not isinstance(keys, list)
+                    or not isinstance(children, list)
+                    or not children
+                    or len(children) != len(keys) + 1
+                ):
+                    raise StorageError("btree internal page %d is malformed" % page_id)
+                first = last = None
+                for position, child in enumerate(children):
+                    child_first, child_last = walk(child, depth + 1)
+                    if child_first is None:
+                        raise StorageError("btree page %d has an empty subtree" % child)
+                    if position == 0:
+                        first = child_first
+                    else:
+                        if keys[position - 1] != child_first:
+                            raise StorageError(
+                                "btree page %d has a stale separator key" % page_id
+                            )
+                        if not _key_less(last, child_first):
+                            raise StorageError("btree page %d is not sorted" % page_id)
+                    last = child_last
+                return first, last
+            raise StorageError("btree page %d has an unknown kind %r" % (page_id, kind))
+
+        walk(root, 0)
+        for position, (page_id, follow) in enumerate(leaves):
+            expect = leaves[position + 1][0] if position + 1 < len(leaves) else None
+            if follow != expect:
+                raise StorageError("btree leaf %d has a broken next pointer" % page_id)
+        return entries, visited
+
+    def _check_index_section(self, meta, section):
+        """Validate the persisted B+ tree section; return ``{tag: entries}``.
+
+        Every check behind the durability contract lives here: page numbers
+        and checksums (via the pager), root-to-leaf connectivity, key order
+        and primary key references, plus an exact comparison against the
+        committed rows.  A legacy image has no ``index_section`` and yields
+        an empty mapping; anything inconsistent raises :class:`StorageError`.
+        """
+        if section is None:
+            return {}
+        if not isinstance(section, dict):
+            raise StorageError("index section descriptor is malformed")
+        try:
+            tree_first = int(section["tree_first"])
+            tree_count = int(section["tree_count"])
+            dir_page = int(section["dir_page"])
+            dir_pages = int(section["dir_pages"])
+            dir_len = int(section["dir_len"])
+            audit_pages = int(meta["audit_pages"])
+            state_page = int(meta["state_page"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise StorageError("index section descriptor is malformed: %s" % exc)
+        if tree_first != AUDIT_PAGE + audit_pages or tree_count < 0:
+            raise StorageError("index pages do not start after the audit pages")
+        if dir_page != tree_first + tree_count or dir_pages < 1 or dir_len < 0:
+            raise StorageError("index directory does not follow the btree pages")
+        if state_page != dir_page + dir_pages:
+            raise StorageError("state pages do not follow the index section")
+        blob = self._read_pages(dir_page, dir_pages, dir_len)
+        try:
+            directory = json.loads(blob.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise StorageError("index directory is not valid JSON: %s" % exc)
+        if not isinstance(directory, dict) or directory.get("format") != INDEX_FORMAT:
+            raise StorageError("index directory has an unknown format")
+        listed = directory.get("indexes")
+        if not isinstance(listed, list):
+            raise StorageError("index directory is missing its index list")
+        roots = {}
+        for item in listed:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("table"), str)
+                or not isinstance(item.get("column"), str)
+                or not isinstance(item.get("root"), int)
+                or isinstance(item.get("root"), bool)
+            ):
+                raise StorageError("index directory holds a malformed entry")
+            tag = (item["table"], item["column"])
+            if tag in roots:
+                raise StorageError("index directory lists %s.%s twice" % tag)
+            roots[tag] = item["root"]
+        catalog = {
+            (name, column)
+            for name, table in self.tables.items()
+            for column in table["indexes"]
+        }
+        if set(roots) != catalog:
+            raise StorageError("index directory does not match the catalog indexes")
+        visited = set()
+        result = {}
+        for tag in sorted(roots):
+            entries, pages = self._read_btree(roots[tag], tag)
+            overlap = visited & pages
+            if overlap:
+                raise StorageError("btree page %d is shared between indexes" % min(overlap))
+            visited |= pages
+            expected = [
+                [_entry_key(value, pk), value, pk]
+                for value, pk in self._committed_index_entries(*tag)
+            ]
+            if entries != expected:
+                raise StorageError(
+                    "btree for %s.%s does not match the committed rows" % tag
+                )
+            result[tag] = [(item[1], item[2]) for item in entries]
+        region = set(range(tree_first, tree_first + tree_count))
+        if visited != region:
+            stray = sorted(visited - region)
+            orphans = sorted(region - visited)
+            raise StorageError(
+                "btree page mismatch: out of section %s, unreachable %s"
+                % (stray[:3], orphans[:3])
+            )
+        return result
+
+    def _index_pages_consistent(self):
+        """Re-read the persisted index section from disk; False on any damage."""
+        if self.pager.page_count() == 0:
+            return True  # an empty image holds no index pages at all
+        try:
+            meta = self._read_json(META_PAGE)
+            if not isinstance(meta, dict) or meta.get("format") != STATE_FORMAT:
+                return False
+            blob = self._read_pages(meta["state_page"], meta["state_pages"], meta["state_len"])
+            state = json.loads(blob.decode("utf-8"))
+            if not isinstance(state, dict) or state.get("format") != DB_FORMAT:
+                return False
+            self._check_index_section(meta, state.get("index_section"))
+        except (StorageError, ValueError, KeyError, TypeError, UnicodeDecodeError):
+            return False
+        return True
 
     # ------------------------------------------------------------- row writes
     def _build_values(self, table, row, current):
@@ -1056,7 +1457,9 @@ class Engine:
                 "pages": pages,
                 "wal_records": self.pager.wal_records(),
                 "crc_ok": crc_ok,
-                "ok": bool(crc_ok and self._indexes_consistent()),
+                "ok": bool(
+                    crc_ok and self._indexes_consistent() and self._index_pages_consistent()
+                ),
             }
 
     def _indexes_consistent(self):
